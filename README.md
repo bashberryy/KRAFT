@@ -1,2 +1,1 @@
-# TPMstateDEM
-TPM state demolisher. Resets TPM and glitches so that kernel version resets to 1. something like that...
+# KRAFT - Kernel Rollback Adjustment & Factory Tool
