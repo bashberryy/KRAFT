@@ -1,15 +1,27 @@
 # KRAFT - Kernel Rollback Adjustment & Factory Tool
 
-<p align="center">
-  <pre>
+<pre>
 ██╗  ██╗ ██████╗   █████╗  ███████╗ ████████╗
 ██║ ██╔╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ╚══██╔══╝
 █████╔╝  ██████╔╝ ███████║ █████╗      ██║
 ██╔═██╗  ██╔══██╗ ██╔══██║ ██╔══╝      ██║
 ██║  ██╗ ██║  ██║ ██║  ██║ ██║         ██║
 ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝         ╚═╝
-  </pre>
-</p>
+__________________________________________
+
+  board: <board>   cros: M<version>   kernver: <version>
+
+  1) TPM Reset
+  2) GBB Flags
+  3) Cr50 Reset
+  4) Device Info
+  5) Reboot
+  6) Shell
+
+  Choose option: _
+  
+__________________________________________
+</pre>
 
 KRAFT is a research and experimentation project for interacting with low-level ChromeOS recovery, firmware, TPM, and device configuration components.
 
