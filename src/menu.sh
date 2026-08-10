@@ -1,7 +1,9 @@
+## SCRIPT FOUND BY BERRYY!! PLEASE DO NOT USE THIS ON A DEVICE YOU DO NOT OWN, OR YOU MAY FACE CONSEQUENCES WE'RE NOT LIABLE FOR!!!
+## I'll be leaving comments for people who don't understand bash.
 #!/bin/bash
 set -e
 BANNER=/etc/issue
-
+## safe command, greps (pulls) board name through the chromeos built in command, crossystem hwid
 get_board() {
     local b
     b="$(crossystem hwid 2>/dev/null | awk '{print tolower($1)}')"
