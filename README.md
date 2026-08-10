@@ -1,4 +1,4 @@
-# KRAFT — Kernel Rollback Adjustment & Factory Tool
+# KRAFT - Kernel Rollback Adjustment & Factory Tool
 
 <p align="center">
   <pre>
