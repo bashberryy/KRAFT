@@ -113,4 +113,3 @@ Depending on the device and environment, KRAFT provides functionality for:
 * **Rebooting** - restart the device after completing an operation.
 
 > **Availability and behavior may vary by board, ChromeOS version, firmware, and device state.**
-
