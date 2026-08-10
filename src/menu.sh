@@ -10,29 +10,30 @@ get_board() {
     [ -z "$b" ] && b="$(grep CHROMEOS_RELEASE_BOARD /etc/lsb-release 2>/dev/null | cut -d= -f2)"
     echo "${b:-unknown}"
 }
-
+## safe command, anything that uses crossystem is directly pulling from chromeos, so far, there is no access to vpd where more dangerous changes are likely to be made.
+## this gets kernel versoin btw
 get_kernver() {
     local raw
     raw="$(crossystem tpm_kernver 2>/dev/null)"
     [ -z "$raw" ] && echo "unknown" && return
     printf "%d" "$((raw & 0xff))" 2>/dev/null || echo "unknown"
 }
-
+## this gets the version that the kernel will be able to rollback to by pulling from tpm_kernver. it's usually the hex of 1.1 (KV1)
 get_rollback_version() {
     local raw
     raw="$(crossystem tpm_kernver 2>/dev/null)"
     [ -z "$raw" ] && echo "unknown" && return
     printf "%d" "$(((raw >> 8) & 0xff))" 2>/dev/null || echo "unknown"
 }
-
+## a chromeos milestone is sort of just the version, if you ever see people say M before a  chromeos version (like M150) it just means version in skiddy terms.
 get_milestone() {
     grep CHROMEOS_RELEASE_MILESTONE /etc/lsb-release 2>/dev/null | cut -d= -f2
 }
-
+## get the bios version
 get_bios_version() {
     crossystem ro_fwid 2>/dev/null || echo "unknown"
 }
-
+## find internal storagedrive, looks for emmc, sata and nvme's before complete failure.
 setup_disk_vars() {
     intdis="$(get_fixed_dst_drive 2>/dev/null)"
     if [ -z "$intdis" ]; then
@@ -54,7 +55,7 @@ setup_disk_vars() {
         intdis_prefix="$intdis"
     fi
 }
-
+## resets tpm by clearing nvdata, device thinks it's good as new and starts at KV1 (in simple terms)
 reset_tpm() {
     echo ""
     echo "  TPM Reset"
@@ -72,7 +73,7 @@ reset_tpm() {
     else
         echo "  [*] Not in recovery mode — TPM recovery skipped"
     fi
-    
+    ## report new kernel version
     echo ""
     local kernver
     kernver="$(get_kernver)"
@@ -80,7 +81,7 @@ reset_tpm() {
     echo ""
     echo "  Done."
 }
-
+## google binary block flags editor, just a bonus to edit stuff. you probably only need to disable fwmp.
 edit_gbb() {
     echo ""
     echo "  GBB Flags Editor"
@@ -107,12 +108,12 @@ edit_gbb() {
         9) return ;;
         *) echo "  Invalid."; return ;;
     esac
-    flashrom -p host --wp-disable >/dev/null 2>&1 || true
+    flashrom -p host --wp-disable >/dev/null 2>&1 || true ## <-- this one line makes this super unlikely to work since we cannot manually turn of wp on modern devices, it's an spi flash that cannot have a svript conduct eletricity to change it's binary value to bypass anything.
     /usr/share/vboot/bin/set_gbb_flags.sh "$flags" \
         && echo "  [+] GBB flags set to $flags" \
-        || echo "  [-] Failed — HW write protect may be on"
+        || echo "  [-] Failed - HW write protect may be on" ## you can bypass this by disconnected the battery. on most devices, it's the connector in the battery that says "batt" but if there's one that says "MB" pull that out instead since the battery cable is usually obstructed. MB cable connects the battery to the motherboard, as long as you wiggle it out carefully and a little firmly, you'll be able to safely put it back in.
 }
-
+## reset cr50, this is the least likely to work out of every script.
 reset_cr50() {
     echo ""
     echo "  Cr50 Reset"
@@ -122,7 +123,7 @@ reset_cr50() {
         && echo "  [+] Cr50 reset complete" \
         || echo "  [-] cr50-reset.sh not found or failed"
 }
-
+## device stats, doesn't write anything.
 view_device_info() {
     echo ""
     echo "  Device Information"
@@ -140,7 +141,7 @@ view_device_info() {
     echo ""
     read -p "  Press Enter to continue..."
 }
-
+## full menu, shows you the banner and your options and a thingy to pick them. 
 while true; do
     clear
     cat "$BANNER" 2>/dev/null || echo "  TPMstateDEM"
