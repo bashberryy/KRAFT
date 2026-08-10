@@ -1,10 +1,23 @@
 # KRAFT — Kernel Rollback Adjustment & Factory Tool
 
+<p align="center">
+  <pre>
+██╗  ██╗ ██████╗   █████╗  ███████╗ ████████╗
+██║ ██╔╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ╚══██╔══╝
+█████╔╝  ██████╔╝ ███████║ █████╗      ██║
+██╔═██╗  ██╔══██╗ ██╔══██║ ██╔══╝      ██║
+██║  ██╗ ██║  ██║ ██║  ██║ ██║         ██║
+╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝         ╚═╝
+  </pre>
+</p>
+
 KRAFT is a research and experimentation project for interacting with low-level ChromeOS recovery, firmware, TPM, and device configuration components.
 
 ## ⚠️ IMPORTANT!! READ BEFORE USAGE
 
-**KRAFT is intended only for devices that you own or are explicitly authorized to modify.**
+>
+> **KRAFT is intended only for devices that you own or are explicitly authorized to modify!!**
+>
 
 Do **not** use KRAFT on a Chromebook, computer, account, or other device belonging to another person, school, organization, business, or other entity unless you have explicit permission to do so.
 
@@ -73,3 +86,19 @@ Nothing in this README is intended to provide legal advice or to override rights
 By choosing to use KRAFT, you acknowledge that you are responsible for determining whether you are authorized to perform the operation you are attempting and for understanding the potential consequences.
 
 **If you do not own the device and do not have explicit authorization to modify it, don't use KRAFT on it.**
+
+## 🔧 What KRAFT Does
+
+KRAFT is a low-level ChromeOS research and experimentation tool designed to reset the device's kernel version to the absolute lowest possible by editing TPM.
+
+Depending on the device and environment, KRAFT provides functionality for:
+
+* **Device information** - view information about the current ChromeOS device and environment.
+* **Board identification** - identify the board/platform the device is running.
+* **Kernel version information** - inspect the device's stored kernel version state.
+* **TPM-related operations** - perform supported TPM operations provided by the project.
+* **Device-state operations** - interact with supported low-level device state and configuration.
+* **Rebooting** - restart the device after completing an operation.
+
+> **Availability and behavior may vary by board, ChromeOS version, firmware, and device state.**
+
