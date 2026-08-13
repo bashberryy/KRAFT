@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-KRAFT build script
-Downloads a factory shim for the given board, patches it with KRAFT menu,
-and produces a CRU-compatible zip.
+Build helper for KRAFT
 
-Usage:
-    python3 build.py <board>
-    python3 build.py <board> <shim.bin>
+Notes:
+- Prefer dl.cros.download/{board}.zip as the primary shim source.
+- Builds a patched CRU shim zip named dist/kraft_<board>.zip containing
+  chromeos_kraft_<board>.bin inside.
+- Intended to run in CI. Locally it requires GITHUB_ACTIONS=true to run.
 """
-
+## I had no idea json was unsupported in this process lol it unpacks a shim zip and retrieves the .bin :waterfall_cry_emoji:
+import json
 import os
 import shutil
 import struct
@@ -22,22 +23,22 @@ MENU_PATH = os.path.join(SCRIPT_DIR, "src", "menu.sh")
 STARTUP_PATH = os.path.join(SCRIPT_DIR, "src", "startup.conf")
 STUB_PATH = os.path.join(SCRIPT_DIR, "src", "stub.sh")
 BANNER_PATH = os.path.join(SCRIPT_DIR, "bootloader", "ui", "banner.txt")
+BOARDS_JSON = os.path.join(SCRIPT_DIR, "boards", "boards.json")
 
-# Prefer official cros.download mirrors. cros.tech hosts recoveries; keep it as a secondary. (tbh I didn't check cros.tech but we have fallbacks)
+# Primary canonical mirror format requested:
 SHIM_MIRRORS = [
+    "https://dl.cros.download/{board}.zip",
+    # fallback forms/mirrors kept for robustness
     "https://dl.cros.download/files/{board}/{board}.zip",
     "https://cros.tech/shims/{board}.zip",
     "https://dl.blobfox.org/shims/{board}.zip",
-    "https://mirror.akane.network/chromeos/{board}.zip",
 ]
 
-KNOWN_BOARDS = [
-    "ambassador", "banon", "brask", "brya", "clapper", "coral",
-    "corsola", "cyan", "dedede", "edgar", "elm", "enguarde", "fizz",
-    "glimmer", "grunt", "hana", "hatch", "jacuzzi", "kalista", "kefka",
-    "kukui", "lulu", "nami", "nissa", "octopus", "orco", "puff", "pyro",
-    "reef", "reks", "relm", "sand", "sentry", "snappy", "stout",
-    "strongbad", "tidus", "trogdor", "ultima", "volteer", "zork",
+# Fallback hard-coded known boards in case boards/boards.json is missing.
+FALLBACK_KNOWN = [
+    "nissa","brya","corsola","grunt","octopus","dedede","volteer","hatch","zork",
+    "puff","trogdor","strongbad","jacuzzi","kukui","coral","eve","rammus","reef",
+    "elm","hana","samus"
 ]
 
 _SLOT_BLOCKLIST = {
@@ -57,6 +58,20 @@ _SLOT_PREFER = [
     "/usr/sbin/display_boot_message",
     "/usr/sbin/secure-wipe.sh",
 ]
+
+def load_known_boards():
+    if os.path.exists(BOARDS_JSON):
+        try:
+            with open(BOARDS_JSON, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            boards = [k for k in data.keys() if not k.startswith("_")]
+            if boards:
+                return sorted(boards)
+        except Exception:
+            pass
+    return FALLBACK_KNOWN
+
+KNOWN_BOARDS = load_known_boards()
 
 def _progress(count, block, total):
     if total > 0:
@@ -83,33 +98,59 @@ def download_shim(board, dest_dir):
                 os.remove(dest)
     raise RuntimeError(f"All shim mirrors failed for board '{board}'")
 
+def _safe_extract_to(zf, member, dest_path):
+    # Prevent path traversal by using basename
+    bn = os.path.basename(member)
+    out = os.path.join(dest_path, bn)
+    with zf.open(member) as src, open(out, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return out
+
 def extract_bin(path, dest_dir):
+    """
+    Return path to a .bin file inside 'path' (which may be a .bin file or a zip)
+    Handles nested zips; chooses the largest .bin file if multiple exist.
+    """
     if path.endswith(".bin") and zipfile.is_zipfile(path) is False:
         print(f"[build] using bin directly: {os.path.basename(path)}")
         return path
+
     if not zipfile.is_zipfile(path):
         raise RuntimeError(f"{os.path.basename(path)} is not a valid zip")
+
     print(f"[build] extracting bin from {os.path.basename(path)}")
     with zipfile.ZipFile(path, "r") as zf:
-        names = zf.namelist()
-        bins = [n for n in names if n.endswith(".bin")]
-        zips = [n for n in names if n.endswith(".zip")]
-        if bins:
-            dest = os.path.join(dest_dir, os.path.basename(bins[0]))
-            with zf.open(bins[0]) as src, open(dest, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            return dest
-        if zips:
-            inner = os.path.join(dest_dir, os.path.basename(zips[0]))
-            with zf.open(zips[0]) as src, open(inner, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+        infos = zf.infolist()
+        # find .bin entries and .zip entries
+        bin_infos = [i for i in infos if i.filename.lower().endswith(".bin")]
+        zip_infos = [i for i in infos if i.filename.lower().endswith(".zip")]
+
+        if bin_infos:
+            # pick the largest .bin (most likely the real firmware)
+            best = max(bin_infos, key=lambda i: i.file_size or 0)
+            return _safe_extract_to(zf, best.filename, dest_dir)
+
+        if zip_infos:
+            # extract the largest nested zip and recurse
+            best = max(zip_infos, key=lambda i: i.file_size or 0)
+            inner = _safe_extract_to(zf, best.filename, dest_dir)
             return extract_bin(inner, dest_dir)
-    raise RuntimeError(f"No .bin found in {path}")
+
+    raise RuntimeError(f"No .bin found in {os.path.basename(path)}")
 
 def find_root_lba(path):
+    """
+    Parse GPT to find the largest ROOT partition (matching name with 'ROOT').
+    """
     with open(path, "rb") as f:
-        data = f.read(34 * 512)
-    gpt = data[512 : 512 + 92]
+        header = f.read(34 * 512)  # should include primary header + partition table header
+    if len(header) < 1024:
+        raise RuntimeError("Image too small or corrupted (cannot read GPT)")
+
+    gpt = header[512:512+92]
+    if len(gpt) < 92:
+        raise RuntimeError("Invalid GPT header")
+
     part_lba = struct.unpack_from("<Q", gpt, 72)[0]
     num = struct.unpack_from("<I", gpt, 80)[0]
     esz = struct.unpack_from("<I", gpt, 84)[0]
@@ -119,65 +160,114 @@ def find_root_lba(path):
         entries = f.read(num * esz)
 
     roots = []
-    for i in range(min(num, 32)):
-        e = entries[i * esz : (i + 1) * esz]
+    for i in range(min(num, 128)):  # be defensive
+        off = i * esz
+        if off + esz > len(entries):
+            break
+        e = entries[off:off+esz]
         start = struct.unpack_from("<Q", e, 32)[0]
         end = struct.unpack_from("<Q", e, 40)[0]
-        name = e[56:128].decode("utf-16-le").rstrip("\x00")
+        try:
+            name = e[56:128].decode("utf-16-le", "replace").rstrip("\x00")
+        except Exception:
+            name = ""
         if start and "ROOT" in name:
             roots.append((end - start, start, end, name))
 
     if not roots:
         raise RuntimeError("No ROOT partition found in GPT")
-    roots.sort(reverse=True)
+    roots.sort(key=lambda x: x[0], reverse=True)  # largest first
     _, start, end, name = roots[0]
     size_mb = (end - start) * 512 // 1024 // 1024
     print(f"[build] ROOT '{name}': LBA {start}-{end} ({size_mb} MB)")
     return start, end
 
 class Ext2FS:
-    BS = 4096
+    """
+    Minimal ext2 reader/writer sufficient for inserting small scripts.
+    - Computes block size from superblock.
+    - Supports direct blocks and single indirect.
+    """
     def __init__(self, img):
         self.img = img
-        sb = img[1024 : 1024 + 256]
+        # read superblock at offset 1024
+        sb = img[1024:1024+256]
+        if len(sb) < 256:
+            raise RuntimeError("image too small for ext superblock")
+        s_log_block_size = struct.unpack_from("<I", sb, 24)[0]
+        self.BS = 1024 << (s_log_block_size & 0xFFFFFFFF)
         self.ipg = struct.unpack_from("<I", sb, 40)[0]
         self.isz = struct.unpack_from("<H", sb, 88)[0]
         self.gdt = struct.unpack_from("<I", sb, 20)[0] + 1
+
     def _bo(self, n):
         return n * self.BS
+
     def _rb(self, n):
         o = self._bo(n)
         return bytes(self.img[o : o + self.BS])
+
     def _ioff(self, ino):
         g = (ino - 1) // self.ipg
         idx = (ino - 1) % self.ipg
-        gd = self.img[self.gdt * self.BS + g * 32 : self.gdt * self.BS + g * 32 + 32]
-        return struct.unpack_from("<I", gd, 8)[0] * self.BS + idx * self.isz
+        gd_off = self.gdt * self.BS + g * 32
+        gd = self.img[gd_off : gd_off + 32]
+        block = struct.unpack_from("<I", gd, 8)[0]
+        return block * self.BS + idx * self.isz
+
     def _ri(self, ino):
         o = self._ioff(ino)
         return bytes(self.img[o : o + self.isz])
+
     def _blk(self, inode):
-        return [struct.unpack_from("<I", inode, 40 + i * 4)[0]
-                for i in range(12) if struct.unpack_from("<I", inode, 40 + i * 4)[0]]
+        # return list of block numbers from inode (direct + single-indirect)
+        blocks = []
+        for i in range(12):
+            try:
+                b = struct.unpack_from("<I", inode, 40 + i*4)[0]
+            except struct.error:
+                b = 0
+            if b:
+                blocks.append(b)
+        # single indirect
+        try:
+            single = struct.unpack_from("<I", inode, 40 + 12*4)[0]
+        except struct.error:
+            single = 0
+        if single:
+            # read block containing u32 block pointers
+            buf = self._rb(single)
+            count = self.BS // 4
+            for i in range(count):
+                ptr = struct.unpack_from("<I", buf, i*4)[0]
+                if ptr:
+                    blocks.append(ptr)
+        return blocks
+
     def _dir(self, bn):
         blk = self._rb(bn)
         entries = []
         off = 0
         while off < self.BS:
+            if off + 8 > len(blk):
+                break
             ino = struct.unpack_from("<I", blk, off)[0]
             rec = struct.unpack_from("<H", blk, off + 4)[0]
-            nl = blk[off + 6]
             if rec == 0:
                 break
+            nl = blk[off + 6]
             if ino:
-                entries.append((ino, blk[off + 8 : off + 8 + nl].decode("utf-8", "replace")))
+                name = blk[off + 8 : off + 8 + nl].decode("utf-8", "replace")
+                entries.append((ino, name))
             off += rec
         return entries
+
     def find(self, path):
         curr = 2
         for part in [p for p in path.split("/") if p]:
             found = False
-            for b in self._blk(self._ri(curr)):
+            inode = self._ri(curr)
+            for b in self._blk(inode):
                 for ino, name in self._dir(b):
                     if name == part:
                         curr = ino
@@ -188,12 +278,17 @@ class Ext2FS:
             if not found:
                 return None
         return curr
+
     def read(self, ino):
         inode = self._ri(ino)
         size = struct.unpack_from("<I", inode, 4)[0]
-        return b"".join(self._rb(b) for b in self._blk(inode))[:size]
+        data = b"".join(self._rb(b) for b in self._blk(inode))
+        return data[:size]
+
     def cap(self, ino):
-        return len(self._blk(self._ri(ino))) * self.BS
+        blocks = self._blk(self._ri(ino))
+        return len(blocks) * self.BS
+
     def write(self, ino, data):
         inode = self._ri(ino)
         blocks = self._blk(inode)
@@ -327,7 +422,7 @@ def build(board, local_zip=None):
     return out_zip
 
 if __name__ == "__main__":
-    # Disallow running locally; only allow inside CI by default.
+    # Disallow running locally by default; allow explicitly in dev by setting GITHUB_ACTIONS=true
     if os.getenv("GITHUB_ACTIONS") != "true":
         print("This build script is intended to run under CI only. Set GITHUB_ACTIONS=true to override.", file=sys.stderr)
         sys.exit(2)
@@ -339,6 +434,6 @@ if __name__ == "__main__":
     local_zip_arg = sys.argv[2] if len(sys.argv) > 2 else None
     try:
         build(board_arg, local_zip_arg)
-    except (FileNotFoundError, RuntimeError) as e:
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
         print(f"\n[build] ERROR: {e}", file=sys.stderr)
         sys.exit(1)
