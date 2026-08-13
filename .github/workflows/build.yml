@@ -4,48 +4,63 @@ on:
   workflow_dispatch:
     inputs:
       board:
-        description: 'Board name'
+        description: 'Board name (must match an entry in boards/boards.json)'
         required: true
         default: 'nissa'
-  push:
-    branches:
-      - main
 
-permissions:
-  contents: write
+concurrency:
+  group: kraft-build-${{ github.event.inputs.board || 'manual' }}
+  cancel-in-progress: true
 
 jobs:
-  build-matrix:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        board: [nissa, brya, corsola, grunt, octopus, dedede, volteer, hatch, zork, puff, trogdor, strongbad, jacuzzi, kukui, coral, eve, rammus, reef, elm, hana, samus]
-      max-parallel: 1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Validate board exists
+        run: |
+          set -e
+          BOARD="${{ github.event.inputs.board }}"
+          if ! python3 - <<PY
+import json,sys
+data=json.load(open('boards/boards.json'))
+boards=[k for k in data.keys() if not k.startswith('_')]
+if BOARD not in boards:
+    print(f"Board '{BOARD}' not found in boards/boards.json", file=sys.stderr)
+    sys.exit(2)
+print("Board validated:", BOARD)
+PY
+          then exit 1; fi
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 unzip curl wget
+          sudo apt-get install -y python3 unzip curl
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-      - name: Download and build
+      - name: Run build
+        env:
+          GITHUB_ACTIONS: "true"
         run: |
-          python3 build.py ${{ matrix.board }}
+          python3 build.py "${{ github.event.inputs.board }}"
       - name: Validate output
         run: |
-          BOARD=${{ matrix.board }}
+          BOARD="${{ github.event.inputs.board }}"
           ZIP="dist/kraft_${BOARD}.zip"
           [ -s "$ZIP" ] || exit 1
           unzip -l "$ZIP"
           COUNT=$(unzip -Z1 "$ZIP" | grep -c '\.bin$' || true)
           [ "$COUNT" -eq 1 ] || exit 1
+          INNER=$(unzip -Z1 "$ZIP" | grep '\.bin$' | head -n1)
+          if [ "$INNER" != "chromeos_kraft_${BOARD}.bin" ]; then
+            echo "Unexpected inner bin name: $INNER" >&2
+            exit 2
+          fi
           sha256sum "$ZIP"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kraft-${{ matrix.board }}
-          path: dist/kraft_${{ matrix.board }}.zip
+          name: kraft-${{ github.event.inputs.board }}
+          path: dist/kraft_${{ github.event.inputs.board }}.zip
           retention-days: 14
