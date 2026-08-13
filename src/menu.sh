@@ -159,7 +159,7 @@ while true; do
     echo "  6) Shell"
     echo ""
     read -p "  Choose option: " choice
-
+## links to above script so when you input an option, these scripts proceed to call the following functions.
     case "$(echo "$choice" | tr 'a-z' 'A-Z')" in
         1) reset_tpm;          read -p "  Press Enter to continue..." ;;
         2) edit_gbb;           read -p "  Press Enter to continue..." ;;
