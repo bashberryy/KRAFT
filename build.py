@@ -1,8 +1,7 @@
-```python name=build.py
 #!/usr/bin/env python3
 """
-TPMstateDEM build script
-Downloads a factory shim for the given board, patches it with TPMstateDEM menu,
+KRAFT build script
+Downloads a factory shim for the given board, patches it with KRAFT menu,
 and produces a CRU-compatible zip.
 
 Usage:
@@ -24,11 +23,12 @@ STARTUP_PATH = os.path.join(SCRIPT_DIR, "src", "startup.conf")
 STUB_PATH = os.path.join(SCRIPT_DIR, "src", "stub.sh")
 BANNER_PATH = os.path.join(SCRIPT_DIR, "bootloader", "ui", "banner.txt")
 
+# Prefer official cros.download mirrors. cros.tech hosts recoveries; keep it as a secondary. (tbh I didn't check cros.tech but we have fallbacks)
 SHIM_MIRRORS = [
     "https://dl.cros.download/files/{board}/{board}.zip",
+    "https://cros.tech/shims/{board}.zip",
     "https://dl.blobfox.org/shims/{board}.zip",
     "https://mirror.akane.network/chromeos/{board}.zip",
-    "https://dl.xz8f.gay/{board}.zip",
 ]
 
 KNOWN_BOARDS = [
@@ -284,7 +284,7 @@ def build(board, local_zip=None):
     board = board.lower().strip("/")
     if board not in KNOWN_BOARDS:
         print(f"[build] WARN: '{board}' not in known boards list")
-    out_zip = os.path.join(SCRIPT_DIR, "dist", f"tpmstatedem_{board}.zip")
+    out_zip = os.path.join(SCRIPT_DIR, "dist", f"kraft_{board}.zip")
     os.makedirs(os.path.join(SCRIPT_DIR, "dist"), exist_ok=True)
     print(f"[build] board:  {board}")
     print(f"[build] output: {out_zip}")
@@ -318,7 +318,7 @@ def build(board, local_zip=None):
         if magic != 0xEF53:
             raise RuntimeError(f"ext2 magic check failed: 0x{magic:04x}")
         print("[build] ext2 magic: OK")
-        inner_name = f"chromeos_tpmstatedem_{board}.bin"
+        inner_name = f"chromeos_kraft_{board}.bin"
         print(f"[build] zipping {os.path.getsize(shim_bin)//1024//1024} MB -> {out_zip}...")
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_STORED) as zf:
             zf.write(shim_bin, inner_name)
@@ -327,6 +327,10 @@ def build(board, local_zip=None):
     return out_zip
 
 if __name__ == "__main__":
+    # Disallow running locally; only allow inside CI by default.
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        print("This build script is intended to run under CI only. Set GITHUB_ACTIONS=true to override.", file=sys.stderr)
+        sys.exit(2)
     if len(sys.argv) < 2:
         print(__doc__)
         print(f"Known boards: {', '.join(KNOWN_BOARDS)}")
