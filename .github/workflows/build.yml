@@ -1,4 +1,4 @@
-name: Build TPMstateDEM
+name: Build KRAFT
 
 on:
   workflow_dispatch:
@@ -20,6 +20,7 @@ jobs:
     strategy:
       matrix:
         board: [nissa, brya, corsola, grunt, octopus, dedede, volteer, hatch, zork, puff, trogdor, strongbad, jacuzzi, kukui, coral, eve, rammus, reef, elm, hana, samus]
+      max-parallel: 1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
       - name: Validate output
         run: |
           BOARD=${{ matrix.board }}
-          ZIP="dist/tpmstatedem_${BOARD}.zip"
+          ZIP="dist/kraft_${BOARD}.zip"
           [ -s "$ZIP" ] || exit 1
           unzip -l "$ZIP"
           COUNT=$(unzip -Z1 "$ZIP" | grep -c '\.bin$' || true)
@@ -45,6 +46,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tpmstatedem-${{ matrix.board }}
-          path: dist/tpmstatedem_${{ matrix.board }}.zip
+          name: kraft-${{ matrix.board }}
+          path: dist/kraft_${{ matrix.board }}.zip
           retention-days: 14
