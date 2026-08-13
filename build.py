@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Build helper for KRAFT
+KRAFT build script
+Downloads a factory shim for the given board, patches it with KRAFT menu,
+and produces a CRU-compatible zip.
 
-Notes:
-- Prefer dl.cros.download/{board}.zip as the primary shim source.
-- Builds a patched CRU shim zip named dist/kraft_<board>.zip containing
-  chromeos_kraft_<board>.bin inside.
-- Intended to run in CI. Locally it requires GITHUB_ACTIONS=true to run.
+Usage:
+    python3 build.py <board>
+    python3 build.py <board> <shim.bin>
 """
-## I had no idea json was unsupported in this process lol it unpacks a shim zip and retrieves the .bin :waterfall_cry_emoji:
+
 import json
 import os
 import shutil
@@ -25,20 +25,23 @@ STUB_PATH = os.path.join(SCRIPT_DIR, "src", "stub.sh")
 BANNER_PATH = os.path.join(SCRIPT_DIR, "bootloader", "ui", "banner.txt")
 BOARDS_JSON = os.path.join(SCRIPT_DIR, "boards", "boards.json")
 
-# Primary canonical mirror format requested:
+# Primary mirror format:
 SHIM_MIRRORS = [
     "https://dl.cros.download/{board}.zip",
-    # fallback forms/mirrors kept for robustness
-    "https://dl.cros.download/files/{board}/{board}.zip",
+    # keep a few fallbacks for robustness obviously
     "https://cros.tech/shims/{board}.zip",
     "https://dl.blobfox.org/shims/{board}.zip",
+    "https://mirror.akane.network/chromeos/{board}.zip",
 ]
 
-# Fallback hard-coded known boards in case boards/boards.json is missing.
+# Fallback hard-coded known boards in case boards/boards.json is missing. (it contains cdn sooooo)
 FALLBACK_KNOWN = [
-    "nissa","brya","corsola","grunt","octopus","dedede","volteer","hatch","zork",
-    "puff","trogdor","strongbad","jacuzzi","kukui","coral","eve","rammus","reef",
-    "elm","hana","samus"
+    "ambassador", "banon", "brask", "brya", "clapper", "coral",
+    "corsola", "cyan", "dedede", "edgar", "elm", "enguarde", "fizz",
+    "glimmer", "grunt", "hana", "hatch", "jacuzzi", "kalista", "kefka",
+    "kukui", "lulu", "nami", "nissa", "octopus", "orco", "puff", "pyro",
+    "reef", "reks", "relm", "sand", "sentry", "snappy", "stout",
+    "strongbad", "tidus", "trogdor", "ultima", "volteer", "zork",
 ]
 
 _SLOT_BLOCKLIST = {
@@ -68,6 +71,7 @@ def load_known_boards():
             if boards:
                 return sorted(boards)
         except Exception:
+            # fallthrough to fallback
             pass
     return FALLBACK_KNOWN
 
