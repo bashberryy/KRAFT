@@ -62,8 +62,8 @@ reset_tpm() {
     echo "  =========="
     echo ""
     
-    mosys nvram clear 2>/dev/null && echo "  [+] NVData cleared" \
-        || echo "  [-] NVData clear failed (non-fatal)"
+    mosys nvram clear 2>/dev/null && echo "  [+] NVData cleared sucessfully!" \
+        || echo "  [-] NVData clear failed (non-fatal)" ## will not proceed! (correctly at least. too lazy to add a safecatch)
     
     crossystem clear_tpm_owner_request=1 2>/dev/null && echo "  [+] TPM owner clear requested" || true
     
@@ -71,17 +71,17 @@ reset_tpm() {
         chromeos-tpm-recovery 2>/dev/null && echo "  [+] TPM recovery OK" \
             || echo "  [-] TPM recovery failed"
     else
-        echo "  [*] Not in recovery mode — TPM recovery skipped"
+        echo "  [*] Not in recovery mode - TPM recovery skipped. Please boot in recovery and do not run this is any other built in terminal!" ## non fatal error, just refuses to work because the exploit is only possible when full write access to tpm is available
     fi
     ## report new kernel version
     echo ""
     local kernver
     kernver="$(get_kernver)"
-    echo "  Reported TPM Kernel Rollback Version: $kernver"
+    echo "  Reported TPM Kernel Rollback Version: $kernver" ## PRAY THAT IT'S 1.1/0x00010001
     echo ""
     echo "  Done."
 }
-## google binary block flags editor, just a bonus to edit stuff. you probably only need to disable fwmp.
+## google binary block flags editor, just a bonus to edit stuff. you probably only need to disable fwmp. honestly, this should better work in a shell and just use a ccd operation.
 edit_gbb() {
     echo ""
     echo "  GBB Flags Editor"
@@ -93,7 +93,7 @@ edit_gbb() {
     echo "  3) Dev + short delay       (0x9)"
     echo "  4) Disable FWMP            (0x40)"
     echo "  5) Dev + disable FWMP      (0x48)"
-    echo "  6) All useful flags        (0x49)"
+    echo "  6) All useful flags        (0x49)" ## check out binbashbanana's GBB-FLAGINATOR for more!
     echo "  7) Reset to factory        (0x0)"
     echo "  8) Custom hex"
     echo "  9) Back"
