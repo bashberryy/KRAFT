@@ -299,6 +299,65 @@ def trim_trailing_zeroes(path: str) -> None:
                 return
 
 
+
+
+def shrink_gpt_image(path: str) -> None:
+    """
+    Shrink a GPT image to the end of the last allocated partition.
+    Keeps the GPT backup header/table valid after truncation.
+    """
+    sector = 512
+    with open(path, "r+b") as f:
+        f.seek(sector)
+        header = bytearray(f.read(92))
+        if header[:8] != b"EFI PART":
+            raise RuntimeError("No GPT header found")
+
+        part_lba = struct.unpack_from("<Q", header, 72)[0]
+        num = struct.unpack_from("<I", header, 80)[0]
+        size = struct.unpack_from("<I", header, 84)[0]
+
+        f.seek(part_lba * sector)
+        table = f.read(num * size)
+
+        last_lba = 0
+        for i in range(num):
+            entry = table[i * size:(i + 1) * size]
+            if len(entry) < 48:
+                break
+            start = struct.unpack_from("<Q", entry, 32)[0]
+            end = struct.unpack_from("<Q", entry, 40)[0]
+            if start and end and end > last_lba:
+                last_lba = end
+
+        if not last_lba:
+            return
+
+        new_backup_lba = last_lba + 33
+        new_size = new_backup_lba * sector
+
+        # Rewrite backup partition table at the new end.
+        backup_table_lba = new_backup_lba - (num * size + sector - 1) // sector
+        f.seek(backup_table_lba * sector)
+        f.write(table)
+
+        # Rewrite backup GPT header.
+        backup = bytearray(header)
+        struct.pack_into("<Q", backup, 24, new_backup_lba)
+        struct.pack_into("<Q", backup, 32, 1)
+        struct.pack_into("<Q", backup, 72, backup_table_lba)
+
+        # Clear old CRC fields and recalculate.
+        import zlib
+        struct.pack_into("<I", backup, 16, 0)
+        struct.pack_into("<I", backup, 88, zlib.crc32(table) & 0xffffffff)
+        struct.pack_into("<I", backup, 16, zlib.crc32(backup[:92]) & 0xffffffff)
+
+        f.seek(new_backup_lba * sector)
+        f.write(backup)
+        f.truncate(new_size)
+
+
 def find_root_lba(path: str) -> Tuple[int, int]:
     """
     Safely parse GPT and find ROOT-A partition (preferred) or largest 'ROOT' partition by name.
@@ -630,6 +689,7 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
             raise RuntimeError(f"[build:{board}] ext2 magic check failed: 0x{magic:04x}")
 
         trim_trailing_zeroes(shim_bin)
+        shrink_gpt_image(shim_bin)
 
         # create the zip atomically
         inner_name = f"chromeos_kraft_{board}.bin"
