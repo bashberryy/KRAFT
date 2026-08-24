@@ -6,7 +6,7 @@ on:
       board:
         description: "Board name (must match an entry in boards/boards.json)"
         required: true
-        default: "grunt"
+        default: "nissa"
 
 concurrency:
   group: kraft-build-${{ github.event.inputs.board || 'manual' }}
