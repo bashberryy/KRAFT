@@ -282,6 +282,23 @@ def read_uint64_le(buf: bytes, off: int) -> int:
     return struct.unpack_from("<Q", buf, off)[0]
 
 
+
+def trim_trailing_zeroes(path: str) -> None:
+    with open(path, "rb+") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        pos = end
+        chunk = 1024 * 1024
+        while pos > 0:
+            pos = max(0, pos - chunk)
+            f.seek(pos)
+            data = f.read(min(chunk, end - pos))
+            stripped = data.rstrip(b"\x00")
+            if stripped:
+                f.truncate(pos + len(stripped))
+                return
+
+
 def find_root_lba(path: str) -> Tuple[int, int]:
     """
     Safely parse GPT and find ROOT-A partition (preferred) or largest 'ROOT' partition by name.
@@ -611,6 +628,8 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
             magic = struct.unpack("<H", magic_data)[0]
         if magic != 0xEF53:
             raise RuntimeError(f"[build:{board}] ext2 magic check failed: 0x{magic:04x}")
+
+        trim_trailing_zeroes(shim_bin)
 
         # create the zip atomically
         inner_name = f"chromeos_kraft_{board}.bin"
