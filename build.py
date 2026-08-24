@@ -9,7 +9,8 @@ This script:
  - Produces an atomic dist/kraft_<board>.zip with inner name chromeos_kraft_<board>.bin.
 
 Important runtime environment:
- - Intended to run in CI. Locally requires GITHUB_ACTIONS=true to run by default.
+ - Intended to run in CI. Locally requires GITHUB_ACTIONS=true to run by default,
+   or pass --local to skip that check.
  - To allow non-canonical fallback mirrors, set KRAFT_ALLOW_FALLBACK=1 in the environment
    (this is opt-in because other mirrors may be untrusted).
 """
@@ -40,9 +41,10 @@ BANNER_PATH = os.path.join(SCRIPT_DIR, "bootloader", "ui", "banner.txt")
 BOARDS_JSON = os.path.join(SCRIPT_DIR, "boards", "boards.json")
 DIST_DIR = os.path.join(SCRIPT_DIR, "dist")
 
-# Primary canonical mirror only (fallbacks opt-in via KRAFT_ALLOW_FALLBACK=1)
+# cros.download uses /files/<board>/<board>.zip, not just /<board>.zip
+# confirmed from https://cros.download/shims
 SHIM_MIRRORS = [
-    "https://dl.cros.download/{board}.zip"
+    "https://dl.cros.download/files/{board}/{board}.zip"
 ]
 FALLBACK_SHIM_MIRRORS = [
     "https://cros.tech/shims/{board}.zip",
@@ -50,10 +52,17 @@ FALLBACK_SHIM_MIRRORS = [
     "https://mirror.akane.network/chromeos/{board}.zip",
 ]
 
+# board aliases — map HWIDs / codenames to the actual family name used for shim downloads
+# craasneto is the HWID codename for the nissa-craask variant
+BOARD_ALIASES = {
+    "craasneto": "nissa",
+    "craask":    "nissa",
+}
+
 # Safety limits
-HTTP_TIMEOUT = 30  # seconds
-DOWNLOAD_SIZE_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GiB (prevent infinite downloads)
-MIN_FREE_SPACE_BYTES = 200 * 1024 * 1024  # require 200MB free (configurable)
+HTTP_TIMEOUT = 60  # seconds — shims are big, 30 was too short
+DOWNLOAD_SIZE_LIMIT = 8 * 1024 * 1024 * 1024  # 8 GiB (prevent infinite downloads) — nissa is ~6 GiB
+MIN_FREE_SPACE_BYTES = 15 * 1024 * 1024 * 1024  # require 15GB free — shim + extracted + output
 
 _SLOT_BLOCKLIST = {
     "/sbin/init",
@@ -114,7 +123,18 @@ def sanitize_board(board_in: str) -> str:
     return b
 
 
-def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT) -> None:
+def resolve_board(board_in: str) -> tuple:
+    """
+    Resolve a board name or alias to (display_name, download_name).
+    display_name is what the user passed; download_name is what we fetch the shim for.
+    e.g. craasneto -> display=craasneto, download=nissa
+    """
+    b = sanitize_board(board_in)
+    download = BOARD_ALIASES.get(b, b)
+    return b, download
+
+
+def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT, board: str = "") -> None:
     """
     Stream-download from `url` to `dest_path` with timeout and size limit.
     """
@@ -122,15 +142,27 @@ def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT) -> None
     try:
         with urlopen(req, timeout=timeout) as resp:
             total = 0
+            last_print = 0.0
+            content_length = resp.headers.get("Content-Length")
+            total_expected = int(content_length) if content_length else None
             with open(dest_path, "wb") as out:
                 while True:
-                    chunk = resp.read(8192)
+                    chunk = resp.read(1024 * 1024)  # 1MB chunks
                     if not chunk:
                         break
                     out.write(chunk)
                     total += len(chunk)
                     if total > DOWNLOAD_SIZE_LIMIT:
                         raise RuntimeError(f"Download exceeded size limit ({DOWNLOAD_SIZE_LIMIT} bytes)")
+                    now = time.monotonic()
+                    if now - last_print >= 5:
+                        mb = total / 1024 / 1024
+                        if total_expected:
+                            pct = total / total_expected * 100
+                            print(f"[build:{board}]   {mb:.0f} MB / {total_expected/1024/1024:.0f} MB ({pct:.1f}%)")
+                        else:
+                            print(f"[build:{board}]   {mb:.0f} MB downloaded...")
+                        last_print = now
     except HTTPError as e:
         raise RuntimeError(f"HTTP error {e.code} when downloading {url}: {e.reason}")
     except URLError as e:
@@ -140,10 +172,10 @@ def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT) -> None
         raise RuntimeError(f"Failed to download {url}: {e}")
 
 
-def download_shim(board: str, dest_dir: str) -> str:
+def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> str:
     mirrors = list(SHIM_MIRRORS)
-    # allow explicit opt-in for the fallback mirrors via env var
-    if os.getenv("KRAFT_ALLOW_FALLBACK", "") == "1":
+    # allow explicit opt-in for the fallback mirrors via env var or --local flag
+    if allow_fallback or os.getenv("KRAFT_ALLOW_FALLBACK", "") == "1":
         mirrors += FALLBACK_SHIM_MIRRORS  # type: ignore
 
     last_exc = None
@@ -152,7 +184,7 @@ def download_shim(board: str, dest_dir: str) -> str:
         dest = os.path.join(dest_dir, f"{board}.zip")
         print(f"[build:{board}] trying download: {url}")
         try:
-            http_download(url, dest)
+            http_download(url, dest, board=board)
             # quick check: not empty and valid zip or a plain .bin (we expect zip)
             if os.path.getsize(dest) == 0:
                 os.remove(dest)
@@ -216,7 +248,7 @@ def choose_bin_from_zip(zf: zipfile.ZipFile, board: str) -> str:
     if len(names) == 1:
         return names[0]
     # 4) ambiguous — fail rather than guessing
-    raise RuntimeError(f"Multiple .bin files found in shim zip ({len(names)}); cannot automatically choose. Provide explicit local shim or set KRAFT_ALLOW_FALLBACK=1 and retry.")
+    raise RuntimeError(f"Multiple .bin files found in shim zip ({len(names)}); cannot automatically choose. Provide explicit local shim.")
 
 
 def extract_bin(path: str, dest_dir: str, board: str) -> str:
@@ -252,7 +284,7 @@ def read_uint64_le(buf: bytes, off: int) -> int:
 
 def find_root_lba(path: str) -> Tuple[int, int]:
     """
-    Safely parse GPT and find the largest 'ROOT' partition by name.
+    Safely parse GPT and find ROOT-A partition (preferred) or largest 'ROOT' partition by name.
     Validate signature and partition table bounds.
     """
     fsize = os.path.getsize(path)
@@ -288,8 +320,9 @@ def find_root_lba(path: str) -> Tuple[int, int]:
             roots.append((end - start, start, end, name))
     if not roots:
         raise RuntimeError("No valid ROOT partition found in GPT")
-    roots.sort(key=lambda x: x[0], reverse=True)
-    _, start, end, name = roots[0]
+    # prefer ROOT-A specifically; fall back to largest if not found
+    root_a = [r for r in roots if r[3].upper() == "ROOT-A"]
+    _, start, end, name = root_a[0] if root_a else sorted(roots, key=lambda x: x[0], reverse=True)[0]
     return int(start), int(end)
 
 
@@ -496,12 +529,15 @@ def verify_zip_contains_expected(out_zip: str, inner_name: str, board: str):
             raise RuntimeError(f"[build:{board}] unexpected inner bin name: {entries[0]} (expected {inner_name})")
 
 
-def build(board_in: str, local_zip: Optional[str] = None) -> str:
+def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool = False) -> str:
     # Basic sanity checks
     boards_cfg = read_boards_file()
-    board = sanitize_board(board_in)
+    display_board, board = resolve_board(board_in)
     if board not in boards_cfg:
-        raise RuntimeError(f"[build:{board}] Unsupported board (not present in boards/boards.json)")
+        raise RuntimeError(f"[build:{display_board}] Unsupported board (not present in boards/boards.json)")
+
+    if display_board != board:
+        print(f"[build:{display_board}] resolved alias -> {board}")
 
     # required files
     for p in [MENU_PATH, STARTUP_PATH, STUB_PATH, BANNER_PATH]:
@@ -521,7 +557,7 @@ def build(board_in: str, local_zip: Optional[str] = None) -> str:
                 raise FileNotFoundError(f"[build:{board}] local shim {local_zip} not found")
             shim_bin = extract_bin(local_zip, temp_dir, board)
         else:
-            shim_zip = download_shim(board, temp_dir)
+            shim_zip = download_shim(board, temp_dir, allow_fallback=allow_fallback)
             shim_bin = extract_bin(shim_zip, temp_dir, board)
 
         # verify shim_bin exists and is reasonable
@@ -579,7 +615,7 @@ def build(board_in: str, local_zip: Optional[str] = None) -> str:
         # create the zip atomically
         inner_name = f"chromeos_kraft_{board}.bin"
         tmp_out = out_zip + f".tmp{os.getpid()}"
-        with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_STORED) as zf:
+        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             zf.write(shim_bin, inner_name)
         # verify zipped content
         verify_zip_contains_expected(tmp_out, inner_name, board)
@@ -597,18 +633,25 @@ def build(board_in: str, local_zip: Optional[str] = None) -> str:
 
 
 if __name__ == "__main__":
-    if os.getenv("GITHUB_ACTIONS") != "true":
-        print("This build script is intended to run in CI. Set GITHUB_ACTIONS=true to override.", file=sys.stderr)
+    import argparse
+    parser = argparse.ArgumentParser(description="KRAFT build script")
+    parser.add_argument("board", help="Board name or alias (e.g. nissa, craasneto)")
+    parser.add_argument("local_zip", nargs="?", default=None, help="Optional local shim .zip or .bin")
+    parser.add_argument("--local", action="store_true",
+                        help="Run outside of CI (WSL/local machine). Also enables fallback mirrors.")
+    parser.add_argument("--fallback", action="store_true",
+                        help="Enable fallback mirrors even without --local.")
+    args = parser.parse_args()
+
+    in_ci = os.getenv("GITHUB_ACTIONS") == "true"
+    if not in_ci and not args.local:
+        print(f"This build script is intended to run in CI. Pass --local to run here:\n  python3 build.py {args.board} --local", file=sys.stderr)
         sys.exit(2)
-    if len(sys.argv) < 2:
-        print("Usage: python3 build.py <board> [local-shim.zip|shim.bin]")
-        sys.exit(1)
-    board_arg = sys.argv[1]
-    local_zip_arg = sys.argv[2] if len(sys.argv) > 2 else None
+
     try:
-        build(board_arg, local_zip_arg)
+        build(args.board, args.local_zip, allow_fallback=(args.local or args.fallback))
     except Exception as e:
-        print(f"[build:{board_arg}] ERROR: {e}", file=sys.stderr)
+        print(f"[build:{args.board}] ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
 ## I LOVE PYTHon? do I?
