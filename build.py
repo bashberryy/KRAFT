@@ -361,6 +361,7 @@ def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> No
         return
 
     with open(path, "rb") as f:
+        f.seek(1024)
         sb = bytearray(f.read(1024))
     if len(sb) != 1024 or struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
         raise RuntimeError(f"[build:{board}] resized filesystem has no valid primary superblock")
