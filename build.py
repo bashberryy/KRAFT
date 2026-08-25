@@ -174,46 +174,52 @@ def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT, board: 
 
 
 def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> str:
+    # Cache the large source archive between GitHub Actions runs. The workflow
+    # caches this directory, so repeat builds avoid downloading ~6 GiB again.
+    cache_dir = os.path.expanduser("~/.cache/kraft/shims")
+    os.makedirs(cache_dir, exist_ok=True)
+    cached = os.path.join(cache_dir, f"{board}.zip")
+
+    if os.path.isfile(cached) and os.path.getsize(cached) > 0:
+        print(f"[build:{board}] using cached shim: {cached}")
+        return cached
+
     mirrors = list(SHIM_MIRRORS)
-    # allow explicit opt-in for the fallback mirrors via env var or --local flag
     if allow_fallback or os.getenv("KRAFT_ALLOW_FALLBACK", "") == "1":
-        mirrors += FALLBACK_SHIM_MIRRORS  # type: ignore
+        mirrors += FALLBACK_SHIM_MIRRORS
 
     last_exc = None
     for template in mirrors:
         url = template.format(board=board)
-        dest = os.path.join(dest_dir, f"{board}.zip")
+        dest = os.path.join(dest_dir, f"{board}.download")
         print(f"[build:{board}] trying download: {url}")
         try:
             http_download(url, dest, board=board)
-            # quick check: not empty and valid zip or a plain .bin (we expect zip)
             if os.path.getsize(dest) == 0:
-                os.remove(dest)
                 raise RuntimeError("Downloaded file is empty")
+
             if zipfile.is_zipfile(dest):
-                print(f"[build:{board}] download OK (zip)")
-                return dest
-            else:
-                # Some mirrors return the raw shim image instead of a zip.
-                # Wrap it so the normal extraction pipeline can continue.
-                if os.path.getsize(dest) > 1024 * 1024:
-                    wrapped = os.path.join(dest_dir, f"{board}-wrapped.zip")
-                    with zipfile.ZipFile(wrapped, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-                        zf.write(dest, f"{board}.bin")
-                    os.remove(dest)
-                    print(f"[build:{board}] download OK (raw bin wrapped)")
-                    return wrapped
-                os.remove(dest)
-                raise RuntimeError("Downloaded file is not a usable shim archive")
+                shutil.copy2(dest, cached)
+                print(f"[build:{board}] download OK (zip); cached at {cached}")
+                return cached
+
+            # Some mirrors now serve the raw .bin directly. Put it in a ZIP so
+            # the existing extraction path stays identical for both formats.
+            if dest.lower().endswith(".bin") or not zipfile.is_zipfile(dest):
+                wrapped = cached + ".tmp"
+                with zipfile.ZipFile(wrapped, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                    zf.write(dest, f"{board}.bin")
+                os.replace(wrapped, cached)
+                print(f"[build:{board}] download OK (raw .bin); cached as zip at {cached}")
+                return cached
         except Exception as e:
             last_exc = e
             print(f"[build:{board}] download failed for {url}: {e}")
-            if os.path.exists(dest):
+            for candidate in (dest,):
                 try:
-                    os.remove(dest)
-                except Exception:
+                    os.remove(candidate)
+                except FileNotFoundError:
                     pass
-            # small backoff before trying next mirror
             time.sleep(1)
     raise RuntimeError(f"[build:{board}] All shim mirrors failed. Last error: {last_exc}")
 
@@ -487,60 +493,64 @@ def compact_gpt_image(path: str, board: str) -> str:
     if not entries:
         raise RuntimeError(f"[build:{board}] GPT contains no partitions")
 
-    root_entries = [e for e in entries if e["name"].upper() == "ROOT-A" or e["name"].upper() == "ROOT-B"]
+    root_entries = [e for e in entries if e["name"].upper() in {"ROOT-A", "ROOT-B"}]
     if not root_entries:
         raise RuntimeError(f"[build:{board}] no ROOT-A/ROOT-B partitions found")
+
+    print(f"[build:{board}] GPT partitions:")
+    for e in entries:
+        size_mib = (e["end"] - e["start"] + 1) * sector / 1024 / 1024
+        print(f"[build:{board}]   {e['name'] or '(unnamed)'}: {size_mib:.1f} MiB")
 
     first_root_index = min(e["index"] for e in root_entries)
     work_dir = tempfile.mkdtemp(prefix=f"kraft-compact-{board}-")
     compact_path = path + f".compact.{os.getpid()}.bin"
 
     try:
-        # Only ROOT partitions need temporary copies. Other partitions are read directly
-        # from the original image while the new image is written, which avoids needing
-        # another full copy of a multi-GiB shim on the GitHub runner.
-        root_indices = {x["index"] for x in root_entries}
+        # Only filesystem partitions are copied to temporary files. We compact
+        # every ext2/3/4 filesystem we can identify, because STATE can account
+        # for most of a large RMA/recovery shim while ROOT-A is relatively small.
         for e in entries:
-            if e["index"] not in root_indices:
-                continue
             part_path = os.path.join(work_dir, f"part-{e['index']:03d}.img")
-            e["src_path"] = part_path
-            with open(path, "rb") as src, open(part_path, "wb") as dst:
+            with open(path, "rb") as src:
                 src.seek(e["start"] * sector)
-                remaining = (e["end"] - e["start"] + 1) * sector
-                while remaining:
-                    chunk = src.read(min(16 * 1024 * 1024, remaining))
-                    if not chunk:
-                        raise RuntimeError(f"[build:{board}] truncated partition {e['index']}")
-                    dst.write(chunk)
-                    remaining -= len(chunk)
+                with open(part_path, "wb") as dst:
+                    remaining = (e["end"] - e["start"] + 1) * sector
+                    while remaining:
+                        chunk = src.read(min(16 * 1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError(f"[build:{board}] truncated partition {e['index']}")
+                        dst.write(chunk)
+                        remaining -= len(chunk)
 
             old_sectors = e["end"] - e["start"] + 1
-
-            # Not every ChromeOS ROOT slot is an ext filesystem. In particular,
-            # some Nissa images contain a non-ext ROOT-B payload. Only pass an
-            # actual ext2/3/4 filesystem to e2fsck/resize2fs; preserve everything
-            # else byte-for-byte and let the repacker move it unchanged.
             with open(part_path, "rb") as part:
                 part.seek(1024 + 0x38)
                 magic = part.read(2)
 
-            if magic != b"\x53\xef":
+            if magic == b"\x53\xef":
+                e["src_path"] = part_path
+                try:
+                    new_sectors = _filesystem_min_size(part_path, board)
+                    if new_sectors < old_sectors:
+                        with open(part_path, "rb+") as f:
+                            f.truncate(new_sectors * sector)
+                        e["new_size_sectors"] = new_sectors
+                        print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
+                    else:
+                        print(f"[build:{board}] {e['name']}: ext filesystem did not shrink ({old_sectors * sector / 1024 / 1024:.1f} MiB)")
+                except RuntimeError as exc:
+                    # ROOT failures remain fatal because they are the patched boot
+                    # payload. Other ext partitions are retained at their original size.
+                    if e["name"].upper() in {"ROOT-A", "ROOT-B"}:
+                        raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
+                    print(f"[build:{board}] {e['name']}: could not shrink; preserving original size: {exc}")
+            else:
+                # Non-filesystem partitions (kernels, firmware, EFI, etc.) are
+                # preserved byte-for-byte.
                 print(f"[build:{board}] {e['name']}: not an ext filesystem; preserving partition unchanged")
-                continue
+                os.remove(part_path)
 
-            try:
-                new_sectors = _filesystem_min_size(part_path, board)
-                if new_sectors >= old_sectors:
-                    print(f"[build:{board}] {e['name']}: filesystem did not shrink ({old_sectors} sectors)")
-                else:
-                    with open(part_path, "rb+") as f:
-                        f.truncate(new_sectors * sector)
-                    e["filesystem_shrunk"] = True
-                    e["new_size_sectors"] = new_sectors
-                    print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
-            except RuntimeError as exc:
-                raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
 
         # Keep everything before the first ROOT partition exactly where it was.
         # From the first ROOT onward, pack partitions with 1 MiB alignment.
@@ -612,13 +622,11 @@ def compact_gpt_image(path: str, board: str) -> str:
             out.seek(entry_lba * sector)
             out.write(table)
 
-            root_indices = {x["index"] for x in root_entries}
             for e in entries:
                 dst_off = e["new_start"] * sector
                 out.seek(dst_off)
-                if e["index"] in root_indices:
-                    src_path = e["src_path"]
-                    with open(src_path, "rb") as part:
+                if "src_path" in e:
+                    with open(e["src_path"], "rb") as part:
                         shutil.copyfileobj(part, out, length=16 * 1024 * 1024)
                 else:
                     with open(path, "rb") as src:
@@ -954,22 +962,11 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
         with open(BANNER_PATH, "rb") as f: banner = f.read()
         img = patch_rootfs(img, menu, startup, banner, board)
 
-        # write back into shim file (atomic via tmp file)
-        tmp_shim = shim_bin + f".patched.{os.getpid()}.tmp"
-        # copy original to tmp_shim and then patch the region
-        shutil.copyfile(shim_bin, tmp_shim)
-        try:
-            with open(tmp_shim, "r+b") as f:
-                f.seek(p3_start)
-                f.write(img)
-        except Exception:
-            try:
-                os.remove(tmp_shim)
-            except Exception:
-                pass
-            raise
-        # replace original shim with patched one (atomic on same filesystem)
-        os.replace(tmp_shim, shim_bin)
+        # The shim was extracted into our disposable build directory, so patch it
+        # in place. Avoiding a full 6 GiB atomic copy saves significant CI time.
+        with open(shim_bin, "r+b") as f:
+            f.seek(p3_start)
+            f.write(img)
 
         # quick ext2 magic check
         with open(shim_bin, "rb") as f:
@@ -983,17 +980,30 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
 
         compacted_shim = compact_gpt_image(shim_bin, board)
 
-        # Convert unused zero regions into sparse holes before packaging.
+        # Make genuine sparse holes for all-zero regions. A plain byte-for-byte
+        # copy does not create a sparse file. This primarily helps when filesystem
+        # free space remains inside non-resizable payloads.
         sparse_shim = compacted_shim + ".sparse"
+        zero_block = b"\x00" * (4 * 1024 * 1024)
         with open(compacted_shim, "rb") as srcf, open(sparse_shim, "wb") as dstf:
-            shutil.copyfileobj(srcf, dstf)
-        try:
-            os.remove(compacted_shim)
-        except FileNotFoundError:
-            pass
+            logical = 0
+            while True:
+                chunk = srcf.read(len(zero_block))
+                if not chunk:
+                    break
+                if chunk == zero_block[:len(chunk)]:
+                    dstf.seek(len(chunk), os.SEEK_CUR)
+                else:
+                    dstf.write(chunk)
+                logical += len(chunk)
+            dstf.truncate(logical)
+        physical_mib = os.stat(sparse_shim).st_blocks * 512 / 1024 / 1024
+        logical_mib = os.path.getsize(sparse_shim) / 1024 / 1024
+        print(f"[build:{board}] sparse image: logical {logical_mib:.1f} MiB, physical {physical_mib:.1f} MiB")
+        os.remove(compacted_shim)
         compacted_shim = sparse_shim
 
-        # create the zip atomically. Lower compression is much faster for large images.
+        # Lower DEFLATE compression is much faster for large binary images.
         inner_name = f"chromeos_kraft_{board}.bin"
         tmp_out = out_zip + f".tmp{os.getpid()}"
         with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
