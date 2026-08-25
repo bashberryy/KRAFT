@@ -193,10 +193,24 @@ def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> st
             if zipfile.is_zipfile(dest):
                 print(f"[build:{board}] download OK (zip)")
                 return dest
-            else:
-                # not a zip, maybe a raw bin — require explicit local path for raw .bin to avoid accidental misuse
-                os.remove(dest)
-                raise RuntimeError("Downloaded file is not a zip archive; raw .bin downloads are not allowed from network for safety")
+
+            # Some shim mirrors return the raw disk image instead of an archive.
+            # Wrap it into the format the rest of KRAFT expects.
+            if dest.endswith(".zip") and os.path.getsize(dest) > 1024:
+                with open(dest, "rb") as raw:
+                    magic = raw.read(4)
+                if magic in (b"\x00\xff\xff\xff", b"\x55\xaa\x00\x00") or os.path.getsize(dest) > 1024 * 1024:
+                    bin_path = os.path.join(dest_dir, f"{board}.bin")
+                    os.replace(dest, bin_path)
+                    zip_path = os.path.join(dest_dir, f"{board}.zip")
+                    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                        zf.write(bin_path, arcname=f"{board}.bin")
+                    os.remove(bin_path)
+                    print(f"[build:{board}] download OK (raw bin wrapped)")
+                    return zip_path
+
+            os.remove(dest)
+            raise RuntimeError("Downloaded file is not a supported shim archive")
         except Exception as e:
             last_exc = e
             print(f"[build:{board}] download failed for {url}: {e}")
