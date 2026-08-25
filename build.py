@@ -193,24 +193,10 @@ def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> st
             if zipfile.is_zipfile(dest):
                 print(f"[build:{board}] download OK (zip)")
                 return dest
-
-            # Some shim mirrors return the raw disk image instead of an archive.
-            # Wrap it into the format the rest of KRAFT expects.
-            if dest.endswith(".zip") and os.path.getsize(dest) > 1024:
-                with open(dest, "rb") as raw:
-                    magic = raw.read(4)
-                if magic in (b"\x00\xff\xff\xff", b"\x55\xaa\x00\x00") or os.path.getsize(dest) > 1024 * 1024:
-                    bin_path = os.path.join(dest_dir, f"{board}.bin")
-                    os.replace(dest, bin_path)
-                    zip_path = os.path.join(dest_dir, f"{board}.zip")
-                    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
-                        zf.write(bin_path, arcname=f"{board}.bin")
-                    os.remove(bin_path)
-                    print(f"[build:{board}] download OK (raw bin wrapped)")
-                    return zip_path
-
-            os.remove(dest)
-            raise RuntimeError("Downloaded file is not a supported shim archive")
+            else:
+                # not a zip, maybe a raw bin — require explicit local path for raw .bin to avoid accidental misuse
+                os.remove(dest)
+                raise RuntimeError("Downloaded file is not a zip archive; raw .bin downloads are not allowed from network for safety")
         except Exception as e:
             last_exc = e
             print(f"[build:{board}] download failed for {url}: {e}")
@@ -437,6 +423,16 @@ def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> No
         pass
 
 
+def _is_ext_filesystem(path: str) -> bool:
+    """Return True when the image has the ext2/3/4 primary superblock magic."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(1024 + 0x38)
+            return f.read(2) == b"\x53\xef"
+    except OSError:
+        return False
+
+
 def _filesystem_min_size(rootfs_path: str, board: str) -> int:
     """Shrink an ext2/3/4 filesystem to its minimum whole-block size."""
     if shutil.which("e2fsck") is None or shutil.which("resize2fs") is None:
@@ -502,18 +498,30 @@ def compact_gpt_image(path: str, board: str) -> str:
     compact_path = path + f".compact.{os.getpid()}.bin"
 
     try:
-        # Only ROOT partitions need temporary copies. Other partitions are read directly
-        # from the original image while the new image is written, which avoids needing
-        # another full copy of a multi-GiB shim on the GitHub runner.
+        # Only ROOT partitions that actually contain ext2/3/4 filesystems need
+        # temporary copies. Some ChromeOS images carry a ROOT-B slot that is not
+        # a directly-checkable ext filesystem; preserve those partitions byte-for-byte.
         root_indices = {x["index"] for x in root_entries}
         for e in entries:
             if e["index"] not in root_indices:
                 continue
+
+            old_sectors = e["end"] - e["start"] + 1
+            probe = os.path.join(work_dir, f"probe-{e['index']:03d}.bin")
+            with open(probe, "wb") as dst, open(path, "rb") as src:
+                src.seek(e["start"] * sector + 1024 + 0x38)
+                probe_magic = src.read(2)
+
+            if probe_magic != b"\x53\xef":
+                e["non_ext_root"] = True
+                print(f"[build:{board}] {e['name']}: not an ext filesystem; preserving partition unchanged")
+                continue
+
             part_path = os.path.join(work_dir, f"part-{e['index']:03d}.img")
             e["src_path"] = part_path
             with open(path, "rb") as src, open(part_path, "wb") as dst:
                 src.seek(e["start"] * sector)
-                remaining = (e["end"] - e["start"] + 1) * sector
+                remaining = old_sectors * sector
                 while remaining:
                     chunk = src.read(min(16 * 1024 * 1024, remaining))
                     if not chunk:
@@ -523,7 +531,6 @@ def compact_gpt_image(path: str, board: str) -> str:
 
             try:
                 new_sectors = _filesystem_min_size(part_path, board)
-                old_sectors = e["end"] - e["start"] + 1
                 if new_sectors >= old_sectors:
                     print(f"[build:{board}] {e['name']}: filesystem did not shrink ({old_sectors} sectors)")
                 else:
@@ -533,9 +540,12 @@ def compact_gpt_image(path: str, board: str) -> str:
                     e["new_size_sectors"] = new_sectors
                     print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
             except RuntimeError as exc:
-                    # Do not silently produce a bad image. A ROOT partition must be ext2/3/4
-                    # for the current KRAFT patcher, so a resize failure is fatal.
-                    raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
+                raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
+            finally:
+                try:
+                    os.remove(probe)
+                except FileNotFoundError:
+                    pass
 
         # Keep everything before the first ROOT partition exactly where it was.
         # From the first ROOT onward, pack partitions with 1 MiB alignment.
