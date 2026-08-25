@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 unzip curl
+          sudo apt-get install -y python3 unzip curl e2fsprogs
 
       - name: Free disk space
         run: |
