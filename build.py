@@ -24,6 +24,7 @@ import re
 import shutil
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -283,79 +284,180 @@ def read_uint64_le(buf: bytes, off: int) -> int:
 
 
 
-def trim_trailing_zeroes(path: str) -> None:
-    with open(path, "rb+") as f:
-        f.seek(0, os.SEEK_END)
-        end = f.tell()
-        pos = end
-        chunk = 1024 * 1024
-        while pos > 0:
-            pos = max(0, pos - chunk)
-            f.seek(pos)
-            data = f.read(min(chunk, end - pos))
-            stripped = data.rstrip(b"\x00")
-            if stripped:
-                f.truncate(pos + len(stripped))
-                return
+def _run_tool(args: list, board: str) -> None:
+    try:
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"[build:{board}] required tool is missing: {args[0]}") from e
+    if proc.returncode != 0:
+        output = proc.stdout.strip()
+        raise RuntimeError(f"[build:{board}] {' '.join(args)} failed ({proc.returncode}){': ' + output if output else ''}")
 
 
+def shrink_ext_filesystem(path: str, board: str) -> int:
+    """Check and shrink an ext filesystem image to its minimum size."""
+    # resize2fs refuses to shrink an unclean filesystem. Run a forced check first.
+    try:
+        proc = subprocess.run(["e2fsck", "-fy", path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"[build:{board}] required tool is missing: e2fsck") from e
+    if proc.returncode not in (0, 1):
+        output = proc.stdout.strip()
+        raise RuntimeError(f"[build:{board}] e2fsck failed ({proc.returncode}){': ' + output if output else ''}")
+    _run_tool(["resize2fs", "-M", path], board)
+
+    size = os.path.getsize(path)
+    # Disk partitions are sector based. Round up to 512-byte sectors.
+    return (size + 511) // 512
 
 
-def shrink_gpt_image(path: str) -> None:
-    """
-    Shrink a GPT image to the end of the last allocated partition.
-    Keeps the GPT backup header/table valid after truncation.
-    """
+def _read_gpt(path: str):
     sector = 512
-    with open(path, "r+b") as f:
+    with open(path, "rb") as f:
         f.seek(sector)
         header = bytearray(f.read(92))
         if header[:8] != b"EFI PART":
             raise RuntimeError("No GPT header found")
-
         part_lba = struct.unpack_from("<Q", header, 72)[0]
         num = struct.unpack_from("<I", header, 80)[0]
         size = struct.unpack_from("<I", header, 84)[0]
-
+        if size < 128 or size > 4096 or num == 0 or num > 4096:
+            raise RuntimeError("Invalid GPT partition table dimensions")
         f.seek(part_lba * sector)
-        table = f.read(num * size)
+        table = bytearray(f.read(num * size))
+    if len(table) != num * size:
+        raise RuntimeError("GPT partition table is truncated")
+    return header, table, num, size
 
-        last_lba = 0
-        for i in range(num):
-            entry = table[i * size:(i + 1) * size]
-            if len(entry) < 48:
-                break
-            start = struct.unpack_from("<Q", entry, 32)[0]
-            end = struct.unpack_from("<Q", entry, 40)[0]
-            if start and end and end > last_lba:
-                last_lba = end
 
-        if not last_lba:
-            return
+def _gpt_partition_entries(table: bytes, num: int, size: int):
+    entries = []
+    for i in range(num):
+        off = i * size
+        e = table[off:off + size]
+        if len(e) < 128 or e[:16] == b"\x00" * 16:
+            continue
+        start = struct.unpack_from("<Q", e, 32)[0]
+        end = struct.unpack_from("<Q", e, 40)[0]
+        name = e[56:128].decode("utf-16-le", "replace").rstrip("\x00")
+        if start and end and end >= start:
+            entries.append((i, start, end, name))
+    return entries
 
-        new_backup_lba = last_lba + 33
-        new_size = new_backup_lba * sector
 
-        # Rewrite backup partition table at the new end.
-        backup_table_lba = new_backup_lba - (num * size + sector - 1) // sector
-        f.seek(backup_table_lba * sector)
-        f.write(table)
+def compact_gpt_image(path: str, root_start: int, root_end: int, rootfs_path: str, board: str) -> None:
+    """
+    Replace the allocated ROOT-A partition with its actually-used ext filesystem size.
 
-        # Rewrite backup GPT header.
-        backup = bytearray(header)
-        struct.pack_into("<Q", backup, 24, new_backup_lba)
-        struct.pack_into("<Q", backup, 32, 1)
-        struct.pack_into("<Q", backup, 72, backup_table_lba)
+    ChromeOS shims normally have ROOT-A as the final partition. If anything follows
+    ROOT-A, refuse to silently move it: preserving fixed partition offsets is safer
+    than producing an image whose later partitions no longer match their GPT layout.
+    """
+    sector = 512
+    original_size = os.path.getsize(path)
+    header, table, num, entry_size = _read_gpt(path)
+    entries = _gpt_partition_entries(table, num, entry_size)
 
-        # Clear old CRC fields and recalculate.
-        import zlib
-        struct.pack_into("<I", backup, 16, 0)
-        struct.pack_into("<I", backup, 88, zlib.crc32(table) & 0xffffffff)
-        struct.pack_into("<I", backup, 16, zlib.crc32(backup[:92]) & 0xffffffff)
+    root_entries = [e for e in entries if e[1] == root_start and e[2] == root_end]
+    if not root_entries:
+        raise RuntimeError(f"[build:{board}] ROOT-A GPT entry disappeared while compacting")
+    root_index, _, _, root_name = root_entries[0]
+    if root_name.upper() != "ROOT-A":
+        raise RuntimeError(f"[build:{board}] expected ROOT-A at selected partition, found {root_name!r}")
 
-        f.seek(new_backup_lba * sector)
-        f.write(backup)
-        f.truncate(new_size)
+    following = [e for e in entries if e[1] > root_end]
+    if following:
+        names = ", ".join(e[3] or f"partition-{e[0]+1}" for e in following)
+        raise RuntimeError(
+            f"[build:{board}] ROOT-A is not the final partition ({names}); refusing unsafe partition moves"
+        )
+
+    root_sectors = (os.path.getsize(rootfs_path) + sector - 1) // sector
+    new_root_end = root_start + root_sectors - 1
+
+    # Leave room for the backup GPT header and table. GPT backup table needs
+    # ceil(num * entry_size / 512) sectors immediately before the backup header.
+    table_sectors = (num * entry_size + sector - 1) // sector
+    new_backup_lba = new_root_end + 33
+    if new_backup_lba <= root_start or new_backup_lba < 34:
+        raise RuntimeError(f"[build:{board}] compacted ROOT-A size is invalid")
+
+    # Update the ROOT-A end LBA in the primary table.
+    new_table = bytearray(table)
+    struct.pack_into("<Q", new_table, root_index * entry_size + 40, new_root_end)
+
+    # The backup GPT must fit after the compacted final partition.
+    backup_table_lba = new_backup_lba - table_sectors
+    if backup_table_lba <= new_root_end:
+        raise RuntimeError(f"[build:{board}] no room for backup GPT after compacting ROOT-A")
+
+    import zlib
+
+    # Primary GPT header remains at LBA 1. Its partition-table CRC changes.
+    primary = bytearray(header)
+    struct.pack_into("<Q", primary, 32, new_backup_lba)
+    struct.pack_into("<Q", primary, 48, backup_table_lba - 1)
+    struct.pack_into("<I", primary, 16, 0)
+    struct.pack_into("<I", primary, 88, zlib.crc32(new_table) & 0xffffffff)
+    struct.pack_into("<I", primary, 16, zlib.crc32(primary[:92]) & 0xffffffff)
+
+    # Backup header points back to the primary header and the relocated table.
+    backup = bytearray(primary)
+    struct.pack_into("<Q", backup, 24, new_backup_lba)
+    struct.pack_into("<Q", backup, 32, 1)
+    struct.pack_into("<Q", backup, 72, backup_table_lba)
+    struct.pack_into("<I", backup, 16, 0)
+    struct.pack_into("<I", backup, 88, zlib.crc32(new_table) & 0xffffffff)
+    struct.pack_into("<I", backup, 16, zlib.crc32(backup[:92]) & 0xffffffff)
+
+    tmp_image = path + f".compact.{os.getpid()}.tmp"
+    try:
+        # Copy only the prefix before ROOT-A. The old multi-GB ROOT-A allocation is
+        # never copied into the output image.
+        with open(path, "rb") as src, open(tmp_image, "wb") as dst:
+            remaining = root_start * sector
+            while remaining:
+                chunk = src.read(min(16 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError(f"[build:{board}] source image ended before ROOT-A")
+                dst.write(chunk)
+                remaining -= len(chunk)
+
+            # Write the compacted filesystem and pad it to its GPT partition end.
+            with open(rootfs_path, "rb") as rootfs:
+                remaining = os.path.getsize(rootfs_path)
+                while remaining:
+                    chunk = rootfs.read(min(16 * 1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError(f"[build:{board}] compact ROOT-A filesystem ended early")
+                    dst.write(chunk)
+                    remaining -= len(chunk)
+            pad = new_root_end * sector + sector - dst.tell()
+            if pad < 0:
+                raise RuntimeError(f"[build:{board}] compact ROOT-A exceeded its GPT allocation")
+            if pad:
+                dst.write(b"\x00" * pad)
+
+            # Backup partition table and header at the new end of the image.
+            dst.seek(backup_table_lba * sector)
+            dst.write(new_table)
+            dst.seek(new_backup_lba * sector)
+            dst.write(backup)
+            dst.truncate((new_backup_lba + 1) * sector)
+
+        os.replace(tmp_image, path)
+    finally:
+        if os.path.exists(tmp_image):
+            try:
+                os.remove(tmp_image)
+            except OSError:
+                pass
+
+    new_size = os.path.getsize(path)
+    print(
+        f"[build:{board}] compacted image: "
+        f"{original_size / 1024 / 1024:.0f} MB -> {new_size / 1024 / 1024:.0f} MB"
+    )
 
 
 def find_root_lba(path: str) -> Tuple[int, int]:
@@ -661,26 +763,17 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
         with open(BANNER_PATH, "rb") as f: banner = f.read()
         img = patch_rootfs(img, menu, startup, banner, board)
 
-        # write back into shim file (atomic via tmp file)
-        tmp_shim = shim_bin + f".patched.{os.getpid()}.tmp"
-        # copy original to tmp_shim and then patch the region
-        shutil.copyfile(shim_bin, tmp_shim)
-        try:
-            with open(tmp_shim, "r+b") as f:
-                f.seek(p3_start)
-                f.write(img)
-        except Exception:
-            try:
-                os.remove(tmp_shim)
-            except Exception:
-                pass
-            raise
-        # replace original shim with patched one (atomic on same filesystem)
-        os.replace(tmp_shim, shim_bin)
+        # Write the patched ROOT-A back to a temporary filesystem image.
+        # resize2fs below will turn the originally huge sparse allocation into the
+        # filesystem's actual minimum size before the final disk image is rebuilt.
+        rootfs_path = os.path.join(temp_dir, f"{board}-root-a.img")
+        with open(rootfs_path, "wb") as f:
+            f.write(img)
+        del img
 
         # quick ext2 magic check
-        with open(shim_bin, "rb") as f:
-            f.seek(p3_start + 0x438)
+        with open(rootfs_path, "rb") as f:
+            f.seek(0x438)
             magic_data = f.read(2)
             if len(magic_data) < 2:
                 raise RuntimeError(f"[build:{board}] ext2 magic read out of range")
@@ -688,8 +781,11 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
         if magic != 0xEF53:
             raise RuntimeError(f"[build:{board}] ext2 magic check failed: 0x{magic:04x}")
 
-        trim_trailing_zeroes(shim_bin)
-        shrink_gpt_image(shim_bin)
+        # This is the important part: shrink the filesystem itself, then rebuild
+        # the GPT image around the smaller ROOT-A partition. Truncating the old
+        # disk image alone cannot remove an oversized ROOT-A allocation.
+        shrink_ext_filesystem(rootfs_path, board)
+        compact_gpt_image(shim_bin, root_start, root_end, rootfs_path, board)
 
         # create the zip atomically
         inner_name = f"chromeos_kraft_{board}.bin"
