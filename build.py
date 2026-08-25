@@ -283,17 +283,15 @@ def read_uint64_le(buf: bytes, off: int) -> int:
 
 
 
-def _run_checked(cmd: list[str], board: str) -> None:
-    """Run a system utility and fail with a useful CI error if it fails."""
-    import subprocess
-
+def _run_checked(cmd: list[str], board: str, accepted_codes: tuple[int, ...] = (0,)) -> None:
+    """Run a system utility and fail with a useful CI error if its exit code is unexpected."""
     print(f"[build:{board}] $ {' '.join(cmd)}")
     try:
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=False)
     except FileNotFoundError as exc:
         raise RuntimeError(f"[build:{board}] required utility is missing: {cmd[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"[build:{board}] command failed with exit code {exc.returncode}: {cmd[0]}") from exc
+    if proc.returncode not in accepted_codes:
+        raise RuntimeError(f"[build:{board}] command failed with exit code {proc.returncode}: {cmd[0]}")
 
 
 def _align_lba(lba: int, alignment: int = 2048) -> int:
@@ -446,7 +444,7 @@ def _filesystem_min_size(rootfs_path: str, board: str) -> int:
 
     try:
         # The rootfs is offline in a temporary file, so an automatic repair/check is safe here.
-        _run_checked(["e2fsck", "-fy", rootfs_path], board)
+        _run_checked(["e2fsck", "-fy", rootfs_path], board, accepted_codes=(0, 1))
         _run_checked(["resize2fs", "-M", rootfs_path], board)
     finally:
         if chromeos_bits:
@@ -781,7 +779,7 @@ class Ext2FS:
     def cap(self, ino: int) -> int:
         return len(self._blk(self._ri(ino))) * self.BS
 
-    def write(self, ino: int, data: bytes) -> None:
+    def write(self, ino: int, data: bytes, preserve_size: bool = False) -> None:
         inode = self._ri(ino)
         blocks = self._blk(inode)
         c = len(blocks) * self.BS
@@ -797,7 +795,8 @@ class Ext2FS:
             rem = rem[self.BS:]
             if not rem:
                 break
-        struct.pack_into("<I", self.img, self._ioff(ino) + 4, len(data))
+        if not preserve_size:
+            struct.pack_into("<I", self.img, self._ioff(ino) + 4, len(data))
 
 
 def _scan_shell_slots(fs: Ext2FS):
@@ -852,7 +851,7 @@ def patch_rootfs(img: bytearray, menu: bytes, startup: bytes, banner: bytes, boa
         ino = fs.find(stub_path)
         if ino:
             try:
-                fs.write(ino, real_stub)
+                fs.write(ino, real_stub, preserve_size=True)
                 print(f"[build:{board}] stub -> {stub_path}")
             except ValueError:
                 pass
@@ -862,7 +861,7 @@ def patch_rootfs(img: bytearray, menu: bytes, startup: bytes, banner: bytes, boa
         print(f"[build:{board}] banner -> /etc/issue")
     s_ino = fs.find("/etc/init/startup.conf")
     if s_ino and fs.cap(s_ino) >= len(startup):
-        fs.write(s_ino, startup)
+        fs.write(s_ino, startup, preserve_size=True)
         print(f"[build:{board}] startup.conf patched")
     return img
 
