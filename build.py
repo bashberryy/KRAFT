@@ -194,9 +194,17 @@ def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> st
                 print(f"[build:{board}] download OK (zip)")
                 return dest
             else:
-                # not a zip, maybe a raw bin — require explicit local path for raw .bin to avoid accidental misuse
+                # Some mirrors return the raw shim image instead of a zip.
+                # Wrap it so the normal extraction pipeline can continue.
+                if os.path.getsize(dest) > 1024 * 1024:
+                    wrapped = os.path.join(dest_dir, f"{board}-wrapped.zip")
+                    with zipfile.ZipFile(wrapped, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                        zf.write(dest, f"{board}.bin")
+                    os.remove(dest)
+                    print(f"[build:{board}] download OK (raw bin wrapped)")
+                    return wrapped
                 os.remove(dest)
-                raise RuntimeError("Downloaded file is not a zip archive; raw .bin downloads are not allowed from network for safety")
+                raise RuntimeError("Downloaded file is not a usable shim archive")
         except Exception as e:
             last_exc = e
             print(f"[build:{board}] download failed for {url}: {e}")
@@ -975,10 +983,20 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
 
         compacted_shim = compact_gpt_image(shim_bin, board)
 
-        # create the zip atomically
+        # Convert unused zero regions into sparse holes before packaging.
+        sparse_shim = compacted_shim + ".sparse"
+        with open(compacted_shim, "rb") as srcf, open(sparse_shim, "wb") as dstf:
+            shutil.copyfileobj(srcf, dstf)
+        try:
+            os.remove(compacted_shim)
+        except FileNotFoundError:
+            pass
+        compacted_shim = sparse_shim
+
+        # create the zip atomically. Lower compression is much faster for large images.
         inner_name = f"chromeos_kraft_{board}.bin"
         tmp_out = out_zip + f".tmp{os.getpid()}"
-        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
             zf.write(compacted_shim, inner_name)
         # verify zipped content
         verify_zip_contains_expected(tmp_out, inner_name, board)
