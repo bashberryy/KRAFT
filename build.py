@@ -507,9 +507,22 @@ def compact_gpt_image(path: str, board: str) -> str:
                     dst.write(chunk)
                     remaining -= len(chunk)
 
+            old_sectors = e["end"] - e["start"] + 1
+
+            # Not every ChromeOS ROOT slot is an ext filesystem. In particular,
+            # some Nissa images contain a non-ext ROOT-B payload. Only pass an
+            # actual ext2/3/4 filesystem to e2fsck/resize2fs; preserve everything
+            # else byte-for-byte and let the repacker move it unchanged.
+            with open(part_path, "rb") as part:
+                part.seek(1024 + 0x38)
+                magic = part.read(2)
+
+            if magic != b"\x53\xef":
+                print(f"[build:{board}] {e['name']}: not an ext filesystem; preserving partition unchanged")
+                continue
+
             try:
                 new_sectors = _filesystem_min_size(part_path, board)
-                old_sectors = e["end"] - e["start"] + 1
                 if new_sectors >= old_sectors:
                     print(f"[build:{board}] {e['name']}: filesystem did not shrink ({old_sectors} sectors)")
                 else:
@@ -519,9 +532,7 @@ def compact_gpt_image(path: str, board: str) -> str:
                     e["new_size_sectors"] = new_sectors
                     print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
             except RuntimeError as exc:
-                    # Do not silently produce a bad image. A ROOT partition must be ext2/3/4
-                    # for the current KRAFT patcher, so a resize failure is fatal.
-                    raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
+                raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
 
         # Keep everything before the first ROOT partition exactly where it was.
         # From the first ROOT onward, pack partitions with 1 MiB alignment.
@@ -598,9 +609,7 @@ def compact_gpt_image(path: str, board: str) -> str:
                 dst_off = e["new_start"] * sector
                 out.seek(dst_off)
                 if e["index"] in root_indices:
-                    src_path = e.get("src_path")
-                    if not src_path or not os.path.exists(src_path):
-                        raise RuntimeError(f"[build:{board}] missing temporary source for ROOT partition {e["name"]}")
+                    src_path = e["src_path"]
                     with open(src_path, "rb") as part:
                         shutil.copyfileobj(part, out, length=16 * 1024 * 1024)
                 else:
