@@ -25,6 +25,7 @@ import shutil
 import stat
 import struct
 import sys
+import subprocess
 import tempfile
 import time
 import zipfile
