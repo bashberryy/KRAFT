@@ -101,6 +101,7 @@ jobs:
           fi
 
           echo "Output validated successfully."
+          echo "ZIP size: $(du -h "$ZIP" | cut -f1)"
           sha256sum "$ZIP"
 
       - name: Upload artifact
