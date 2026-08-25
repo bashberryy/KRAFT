@@ -20,6 +20,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache KRAFT shim downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kraft/shims
+          key: kraft-shim-${{ github.event.inputs.board }}
+
       - name: Validate board exists
         env:
           BOARD: ${{ github.event.inputs.board }}
