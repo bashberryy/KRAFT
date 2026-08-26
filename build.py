@@ -866,7 +866,7 @@ def patch_rootfs(img: bytearray, menu: bytes, startup: bytes, banner: bytes, boa
         print(f"[build:{board}] banner -> /etc/issue")
     s_ino = fs.find("/etc/init/startup.conf")
     if s_ino and fs.cap(s_ino) >= len(startup):
-        fs.write(s_ino, startup, preserve_size=True)
+        fs.write(s_ino, startup)
         print(f"[build:{board}] startup.conf patched")
     return img
 
@@ -953,21 +953,43 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
         if magic != 0xEF53:
             raise RuntimeError(f"[build:{board}] ext2 magic check failed: 0x{magic:04x}")
 
-        compacted_shim = compact_gpt_image(shim_bin, board)
+        # extract the shrunk ROOT-A only — no need to ship the full disk image
+        # this is what actually gets written to the USB; the installer only needs ROOT-A
+        root_start2, root_end2 = find_root_lba(shim_bin)
+        roota_start = root_start2 * 512
+        roota_size  = (root_end2 - root_start2) * 512
 
-        # create the zip atomically
+        # shrink ROOT-A in-place before extracting it
+        roota_tmp = os.path.join(temp_dir, f"roota_{board}.bin")
+        with open(shim_bin, "rb") as f:
+            f.seek(roota_start)
+            with open(roota_tmp, "wb") as dst:
+                remaining = roota_size
+                while remaining:
+                    chunk = f.read(min(16 * 1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    remaining -= len(chunk)
+
+        try:
+            shrunk_sectors = _filesystem_min_size(roota_tmp, board)
+            shrunk_size = shrunk_sectors * 512
+            with open(roota_tmp, "rb+") as f:
+                f.truncate(shrunk_size)
+            print(f"[build:{board}] ROOT-A shrunk: {roota_size//1024//1024} MB -> {shrunk_size//1024//1024} MB")
+        except RuntimeError as exc:
+            print(f"[build:{board}] WARNING: could not shrink ROOT-A ({exc}), zipping full partition")
+
+        # create the zip atomically — just ROOT-A, not the full disk image
         inner_name = f"chromeos_kraft_{board}.bin"
         tmp_out = out_zip + f".tmp{os.getpid()}"
         with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
-            zf.write(compacted_shim, inner_name)
+            zf.write(roota_tmp, inner_name)
         # verify zipped content
         verify_zip_contains_expected(tmp_out, inner_name, board)
         # atomic rename
         os.replace(tmp_out, out_zip)
-        try:
-            os.remove(compacted_shim)
-        except FileNotFoundError:
-            pass
 
         print(f"[build:{board}] done: {out_zip} ({os.path.getsize(out_zip)//1024//1024} MB)")
         return out_zip
