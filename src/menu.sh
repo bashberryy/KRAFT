@@ -157,7 +157,7 @@ reset_cr50() {
     echo "  Cr50 Reset"
     echo "  ==========="
     echo ""
-    ## try cr50-reset.sh first, then fall back to gsctool for Ti50 (nissa uses Ti50 not Cr50)
+    ## try cr50-reset.sh first, then fall back to gsctool for Ti50
     if /usr/share/cros/cr50-reset.sh 2>/dev/null; then
         echo "  [+] Cr50 reset complete"
     elif gsctool -a --ccd_open 2>/dev/null; then
