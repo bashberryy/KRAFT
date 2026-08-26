@@ -72,11 +72,50 @@ jobs:
             /usr/local/share/boost \
             "$AGENT_TOOLSDIRECTORY" || true
 
+      - name: Cache shim
+        id: cache-shim
+        uses: actions/cache@v4
+        with:
+          path: shim_cache
+          key: shim-${{ github.event.inputs.board }}-v1
+
+      - name: Restore cached shim
+        if: steps.cache-shim.outputs.cache-hit == 'true'
+        run: |
+          BOARD="${{ github.event.inputs.board }}"
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          mkdir -p /tmp/kraft-shim
+          cp shim_cache/${RESOLVED}.bin /tmp/kraft-shim/${RESOLVED}.bin
+          echo "KRAFT_LOCAL_SHIM=/tmp/kraft-shim/${RESOLVED}.bin" >> $GITHUB_ENV
+
       - name: Run build
         env:
           GITHUB_ACTIONS: "true"
         run: |
-          python3 build.py "${{ github.event.inputs.board }}"
+          BOARD="${{ github.event.inputs.board }}"
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          if [ -n "$KRAFT_LOCAL_SHIM" ] && [ -f "$KRAFT_LOCAL_SHIM" ]; then
+            echo "Using cached shim: $KRAFT_LOCAL_SHIM"
+            python3 build.py "$BOARD" "$KRAFT_LOCAL_SHIM"
+          else
+            python3 build.py "$BOARD"
+            # save shim to cache for next run
+            mkdir -p shim_cache
+            SHIM=$(find /tmp -name "${RESOLVED}.bin" -size +100M 2>/dev/null | head -1)
+            if [ -n "$SHIM" ]; then
+              cp "$SHIM" shim_cache/${RESOLVED}.bin
+            fi
+          fi
 
       - name: Validate output
         env:
