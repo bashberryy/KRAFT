@@ -20,14 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore cached ChromeOS shim
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/kraft/shims
-          key: kraft-shim-${{ github.event.inputs.board }}
-          restore-keys: |
-            kraft-shim-
-
       - name: Validate board exists
         env:
           BOARD: ${{ github.event.inputs.board }}
@@ -70,6 +62,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3 unzip curl e2fsprogs
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/share/dotnet \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
 
       - name: Run build
         env:
@@ -139,4 +140,3 @@ jobs:
           name: kraft-${{ github.event.inputs.board }}
           path: dist/kraft_${{ env.RESOLVED_BOARD }}.zip
           retention-days: 14
-          compression-level: 0
