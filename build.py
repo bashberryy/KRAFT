@@ -634,6 +634,78 @@ def compact_gpt_image(path: str, board: str) -> str:
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+def patch_kernel_version(path: str, board: str) -> None:
+    """
+    Set the kernel version field in KERN-A's vboot preamble to 1.
+
+    When tpm_kernver on the device is higher than the kernel version in the
+    shim's preamble, the firmware refuses to boot the shim (keyrolled).
+    Setting the preamble version to 1 means the firmware will always accept it
+    since 1 is the minimum valid version.
+
+    The kernel blob is already signed with Google's recovery key — we are only
+    changing the version integer in the preamble struct, not the kernel body or
+    the signature. The firmware validates the signature separately and recovery
+    keys bypass the rollback check entirely on most boards, but the preamble
+    version field still needs to be <= tpm_kernver for non-recovery paths.
+    """
+    sector = 512
+    header, entries, entry_lba, entry_size = _read_gpt(path)
+
+    kern_entry = None
+    for e in entries:
+        if e["name"].upper() in ("KERN-A", "KERNEL-A"):
+            kern_entry = e
+            break
+    if kern_entry is None:
+        print(f"[build:{board}] WARNING: no KERN-A partition found, skipping kernel version patch")
+        return
+
+    kern_start = kern_entry["start"] * sector
+    kern_size  = (kern_entry["end"] - kern_entry["start"] + 1) * sector
+
+    with open(path, "rb") as f:
+        f.seek(kern_start)
+        kern_blob = bytearray(f.read(min(kern_size, 4096)))  # preamble is in first few KB
+
+    # vboot kernel blob layout:
+    #   0x00: keyblock (variable size, keyblock_size at offset 0x08)
+    #   keyblock_size: kernel preamble begins here
+    #
+    # kernel preamble layout (VbKernelPreambleHeader):
+    #   0x00  uint64  preamble_size
+    #   0x08  VbSignature preamble_signature (16 bytes)
+    #   0x18  uint32  header_version_major
+    #   0x1c  uint32  header_version_minor
+    #   0x20  uint64  kernel_version    <-- this is what we patch
+    #   ...
+
+    if len(kern_blob) < 16:
+        print(f"[build:{board}] WARNING: KERN-A too small to parse, skipping kernel version patch")
+        return
+
+    # keyblock size is at offset 8 as a uint64
+    keyblock_size = struct.unpack_from("<Q", kern_blob, 8)[0]
+    if keyblock_size < 64 or keyblock_size + 0x28 > len(kern_blob):
+        print(f"[build:{board}] WARNING: keyblock_size {keyblock_size} out of range, skipping kernel version patch")
+        return
+
+    preamble_off = keyblock_size
+    kernel_version_off = preamble_off + 0x20
+
+    current_version = struct.unpack_from("<Q", kern_blob, kernel_version_off)[0]
+    if current_version == 1:
+        print(f"[build:{board}] KERN-A version already 1, no patch needed")
+        return
+
+    print(f"[build:{board}] KERN-A kernel version: {current_version} -> 1 (keyroll fix)")
+    struct.pack_into("<Q", kern_blob, kernel_version_off, 1)
+
+    with open(path, "r+b") as f:
+        f.seek(kern_start)
+        f.write(kern_blob)
+
+
 def find_root_lba(path: str) -> Tuple[int, int]:
     """
     Safely parse GPT and find ROOT-A partition (preferred) or largest 'ROOT' partition by name.
@@ -952,6 +1024,11 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
             magic = struct.unpack("<H", magic_data)[0]
         if magic != 0xEF53:
             raise RuntimeError(f"[build:{board}] ext2 magic check failed: 0x{magic:04x}")
+
+        # patch KERN-A version to 1 so keyrolled devices can boot the shim
+        # the firmware checks tpm_kernver >= kernel preamble version before allowing boot
+        # shims are signed with google's recovery key so the sig is still valid after repacking
+        patch_kernel_version(shim_bin, board)
 
         # extract the shrunk ROOT-A only — no need to ship the full disk image
         # this is what actually gets written to the USB; the installer only needs ROOT-A
