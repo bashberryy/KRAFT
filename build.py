@@ -54,15 +54,16 @@ FALLBACK_SHIM_MIRRORS = [
 ]
 
 # board aliases — map HWIDs / codenames to the actual family name used for shim downloads
+# craasneto is the HWID codename for the nissa-craask variant
 BOARD_ALIASES = {
     "craasneto": "nissa",
     "craask":    "nissa",
 }
 
 # Safety limits
-HTTP_TIMEOUT = 60
-DOWNLOAD_SIZE_LIMIT = 8 * 1024 * 1024 * 1024  # 8 GiB
-MIN_FREE_SPACE_BYTES = 15 * 1024 * 1024 * 1024  # 15 GB
+HTTP_TIMEOUT = 60  # seconds — shims are big, 30 was too short
+DOWNLOAD_SIZE_LIMIT = 8 * 1024 * 1024 * 1024  # 8 GiB (prevent infinite downloads) — nissa is ~6 GiB
+MIN_FREE_SPACE_BYTES = 10 * 1024 * 1024 * 1024  # require 10GB free — shim + compact copy + output zip
 
 _SLOT_BLOCKLIST = {
     "/sbin/init",
@@ -82,6 +83,7 @@ _SLOT_PREFER = [
     "/usr/sbin/secure-wipe.sh",
 ]
 
+# allowed board name pattern
 _BOARD_RE = re.compile(r"^[a-z0-9_\-]+$")
 
 
@@ -90,6 +92,8 @@ def read_boards_file() -> dict:
         raise FileNotFoundError(f"boards.json missing at {BOARDS_JSON}")
     with open(BOARDS_JSON, "r", encoding="utf-8") as fh:
         data = json.load(fh)
+    # detect simple invalid/duplicate entries: json.load already disallows dups at parse-time,
+    # but validate entries contain required fields when present (name/family/arch)
     board_keys = [k for k in data.keys() if not k.startswith("_")]
     if not board_keys:
         raise RuntimeError("No boards found in boards/boards.json")
@@ -121,12 +125,20 @@ def sanitize_board(board_in: str) -> str:
 
 
 def resolve_board(board_in: str) -> tuple:
+    """
+    Resolve a board name or alias to (display_name, download_name).
+    display_name is what the user passed; download_name is what we fetch the shim for.
+    e.g. craasneto -> display=craasneto, download=nissa
+    """
     b = sanitize_board(board_in)
     download = BOARD_ALIASES.get(b, b)
     return b, download
 
 
 def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT, board: str = "") -> None:
+    """
+    Stream-download from `url` to `dest_path` with timeout and size limit.
+    """
     req = Request(url, headers={"User-Agent": "KRAFT-build/1.0"})
     try:
         with urlopen(req, timeout=timeout) as resp:
@@ -136,7 +148,7 @@ def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT, board: 
             total_expected = int(content_length) if content_length else None
             with open(dest_path, "wb") as out:
                 while True:
-                    chunk = resp.read(1024 * 1024)
+                    chunk = resp.read(1024 * 1024)  # 1MB chunks
                     if not chunk:
                         break
                     out.write(chunk)
@@ -157,84 +169,99 @@ def http_download(url: str, dest_path: str, timeout: int = HTTP_TIMEOUT, board: 
     except URLError as e:
         raise RuntimeError(f"URL error when downloading {url}: {e.reason}")
     except Exception as e:
+        # bubble up as RuntimeError
         raise RuntimeError(f"Failed to download {url}: {e}")
 
 
 def download_shim(board: str, dest_dir: str, allow_fallback: bool = False) -> str:
-    cache_dir = os.path.expanduser("~/.cache/kraft/shims")
-    os.makedirs(cache_dir, exist_ok=True)
-    cached = os.path.join(cache_dir, f"{board}.zip")
-
-    if os.path.isfile(cached) and os.path.getsize(cached) > 0:
-        print(f"[build:{board}] using cached shim: {cached}")
-        return cached
-
     mirrors = list(SHIM_MIRRORS)
+    # allow explicit opt-in for the fallback mirrors via env var or --local flag
     if allow_fallback or os.getenv("KRAFT_ALLOW_FALLBACK", "") == "1":
-        mirrors += FALLBACK_SHIM_MIRRORS
+        mirrors += FALLBACK_SHIM_MIRRORS  # type: ignore
 
     last_exc = None
     for template in mirrors:
         url = template.format(board=board)
-        dest = os.path.join(dest_dir, f"{board}.download")
+        dest = os.path.join(dest_dir, f"{board}.zip")
         print(f"[build:{board}] trying download: {url}")
         try:
             http_download(url, dest, board=board)
+            # quick check: not empty and valid zip or a plain .bin (we expect zip)
             if os.path.getsize(dest) == 0:
+                os.remove(dest)
                 raise RuntimeError("Downloaded file is empty")
-
             if zipfile.is_zipfile(dest):
-                shutil.copy2(dest, cached)
-                print(f"[build:{board}] download OK (zip); cached at {cached}")
-                return cached
-
-            if dest.lower().endswith(".bin") or not zipfile.is_zipfile(dest):
-                wrapped = cached + ".tmp"
-                with zipfile.ZipFile(wrapped, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-                    zf.write(dest, f"{board}.bin")
-                os.replace(wrapped, cached)
-                print(f"[build:{board}] download OK (raw .bin); cached as zip at {cached}")
-                return cached
+                print(f"[build:{board}] download OK (zip)")
+                return dest
+            else:
+                # cros.download serves the shim as a raw .bin directly (not zipped)
+                # rename it so extract_bin knows what it is
+                raw = dest.replace(".zip", ".bin")
+                os.rename(dest, raw)
+                print(f"[build:{board}] download OK (raw bin, {os.path.getsize(raw)//1024//1024} MB)")
+                return raw
         except Exception as e:
             last_exc = e
             print(f"[build:{board}] download failed for {url}: {e}")
-            for candidate in (dest,):
+            if os.path.exists(dest):
                 try:
-                    os.remove(candidate)
-                except FileNotFoundError:
+                    os.remove(dest)
+                except Exception:
                     pass
+            # small backoff before trying next mirror
             time.sleep(1)
     raise RuntimeError(f"[build:{board}] All shim mirrors failed. Last error: {last_exc}")
 
 
 def _safe_extract_to(zf: zipfile.ZipFile, member: str, dest_dir: str) -> str:
+    # use basename to prevent path traversal
     bn = os.path.basename(member)
     if not bn:
         raise RuntimeError("Invalid zip member name (empty basename)")
     out = os.path.join(dest_dir, bn)
     with zf.open(member) as src, open(out, "wb") as dst:
         shutil.copyfileobj(src, dst)
+    # ensure proper mode if zip stores it
     return out
 
 
 def choose_bin_from_zip(zf: zipfile.ZipFile, board: str) -> str:
+    """
+    Select the best .bin candidate from zf using ordered heuristic:
+     1) exact match <board>.bin (case-insensitive)
+     2) name contains 'chromeos' or 'factory' or 'recovery'
+     3) if exactly one .bin exists, pick it
+     4) otherwise, fail and require explicit input
+    Returns the member name (not extracted path) to be extracted by caller.
+    """
     names = [n for n in zf.namelist() if n.lower().endswith(".bin")]
     if not names:
         raise RuntimeError("No .bin entries found in shim zip")
+
+    # normalize names
     lc = [n.lower() for n in names]
+    # 1) exact board match
     for i, n in enumerate(lc):
         if os.path.basename(n) == f"{board}.bin":
             return names[i]
+    # 2) prefer names containing keywords
     for i, n in enumerate(lc):
         if "chromeos" in n or "factory" in n or "recovery" in n:
             return names[i]
+    # 3) if there's only one, pick it
     if len(names) == 1:
         return names[0]
-    raise RuntimeError(f"Multiple .bin files found in shim zip ({len(names)}); cannot automatically choose.")
+    # 4) ambiguous — fail rather than guessing
+    raise RuntimeError(f"Multiple .bin files found in shim zip ({len(names)}); cannot automatically choose. Provide explicit local shim.")
 
 
 def extract_bin(path: str, dest_dir: str, board: str) -> str:
-    if path.endswith(".bin") and zipfile.is_zipfile(path) is False:
+    """
+    Given path to a zip (or a nested zip), extract the appropriate .bin and return its path.
+    Raw .bin files (from download or local) are returned as-is.
+    """
+    if path.endswith(".bin"):
+        # raw disk image — nothing to extract
         return path
 
     if not zipfile.is_zipfile(path):
@@ -244,11 +271,14 @@ def extract_bin(path: str, dest_dir: str, board: str) -> str:
         try:
             member = choose_bin_from_zip(zf, board)
         except Exception as e:
+            # if nested zips exist, try to search nested zip heuristics
+            # attempt to look for nested zips and recurse only if single nested zip
             nested = [n for n in zf.namelist() if n.lower().endswith(".zip")]
             if len(nested) == 1:
                 inner = _safe_extract_to(zf, nested[0], dest_dir)
                 return extract_bin(inner, dest_dir, board)
             raise
+        # extract the chosen member
         return _safe_extract_to(zf, member, dest_dir)
 
 
@@ -256,7 +286,9 @@ def read_uint64_le(buf: bytes, off: int) -> int:
     return struct.unpack_from("<Q", buf, off)[0]
 
 
+
 def _run_checked(cmd: list[str], board: str, accepted_codes: tuple[int, ...] = (0,)) -> None:
+    """Run a system utility and fail with a useful CI error if its exit code is unexpected."""
     print(f"[build:{board}] $ {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, check=False)
@@ -267,10 +299,12 @@ def _run_checked(cmd: list[str], board: str, accepted_codes: tuple[int, ...] = (
 
 
 def _align_lba(lba: int, alignment: int = 2048) -> int:
+    """Align a partition start to a 1 MiB boundary."""
     return ((lba + alignment - 1) // alignment) * alignment
 
 
 def _read_gpt(path: str) -> tuple[bytearray, list[dict], int, int]:
+    """Read the primary GPT and return (header, entries, entry_lba, entry_size)."""
     sector = 512
     fsize = os.path.getsize(path)
     if fsize < 34 * sector:
@@ -316,6 +350,7 @@ def _read_gpt(path: str) -> tuple[bytearray, list[dict], int, int]:
 
 
 def _crc32c(data: bytes, crc: int = 0xFFFFFFFF) -> int:
+    """Small CRC32C implementation used only when restoring ChromeOS superblock flags."""
     crc &= 0xFFFFFFFF
     for byte in data:
         crc ^= byte
@@ -325,6 +360,7 @@ def _crc32c(data: bytes, crc: int = 0xFFFFFFFF) -> int:
 
 
 def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> None:
+    """Restore ChromeOS's upper read-only-compatible feature bits after resizing."""
     if not original_bits:
         return
 
@@ -335,9 +371,17 @@ def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> No
         raise RuntimeError(f"[build:{board}] resized filesystem has no valid primary superblock")
 
     block_size = 1024 << struct.unpack_from("<I", sb, 0x18)[0]
+    blocks_count = struct.unpack_from("<Q", sb, 0x150)[0] if len(sb) >= 0x158 else 0
+    if not blocks_count:
+        blocks_count = struct.unpack_from("<I", sb, 0x04)[0]
     ro = struct.unpack_from("<I", sb, 0x64)[0] | original_bits
+
+    # The upper byte is the ChromeOS rootfs verification marker. Keep all other
+    # read-only-compatible feature bits exactly as resize2fs left them.
     struct.pack_into("<I", sb, 0x64, ro)
 
+    # metadata_csum filesystems need their superblock checksum refreshed after
+    # changing the feature field. The checksum covers the superblock through 0x3fb.
     if ro & 0x00000400:
         struct.pack_into("<I", sb, 0x3FC, 0)
         csum = _crc32c(bytes(sb[:0x3FC]))
@@ -359,6 +403,8 @@ def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> No
 
     patch_superblock(1024)
 
+    # Locate backup superblocks from the resized filesystem. `mke2fs -n` does not
+    # modify the image and works after the temporary feature-bit removal.
     try:
         proc = subprocess.run(
             ["dumpe2fs", "-h", path],
@@ -381,9 +427,15 @@ def _restore_chromeos_ro_compat(path: str, original_bits: int, board: str) -> No
 
 
 def _filesystem_min_size(rootfs_path: str, board: str) -> int:
+    """Shrink an ext2/3/4 filesystem to its minimum whole-block size."""
     if shutil.which("e2fsck") is None or shutil.which("resize2fs") is None:
         raise RuntimeError("e2fsprogs is required (e2fsck and resize2fs)")
 
+    # ChromeOS ROOT filesystems commonly carry 0xff000000 in s_feature_ro_compat.
+    # Upstream e2fsprogs intentionally rejects those unknown read-only-compatible
+    # bits, even though the Linux ext4 driver can mount the filesystem read-only.
+    # Temporarily clear only those bits while e2fsck/resize2fs operate, then restore
+    # the exact original marker before the compact image is assembled.
     with open(rootfs_path, "rb") as f:
         f.seek(1024 + 0x64)
         original_ro_compat = struct.unpack("<I", f.read(4))[0]
@@ -396,6 +448,7 @@ def _filesystem_min_size(rootfs_path: str, board: str) -> int:
         print(f"[build:{board}] temporarily cleared ChromeOS ext4 feature marker 0x{chromeos_bits:08x} for resize")
 
     try:
+        # The rootfs is offline in a temporary file, so an automatic repair/check is safe here.
         _run_checked(["e2fsck", "-fy", rootfs_path], board, accepted_codes=(0, 1))
         _run_checked(["resize2fs", "-M", rootfs_path], board)
     finally:
@@ -403,76 +456,78 @@ def _filesystem_min_size(rootfs_path: str, board: str) -> int:
             _restore_chromeos_ro_compat(rootfs_path, chromeos_bits, board)
 
     size = os.path.getsize(rootfs_path)
+    # GPT is sector based; keep the complete filesystem blocks and round up to sectors.
     return (size + 511) // 512
 
 
 def compact_gpt_image(path: str, board: str) -> str:
     """
-    Repack the disk image with corrected GPT header/backup LBA handling.
+    Repack the disk image instead of merely truncating it.
 
-    Fix vs original: the primary header's backup-LBA field (offset 32) and the
-    backup header's self-LBA / primary-LBA / table-LBA fields are set once,
-    in the right order, before the final CRC is calculated. The original code
-    set primary offset-32 twice — once correctly, then overwrote it — causing
-    CRU verification failures and boot refusals.
+    The old implementation could only remove bytes after the last GPT partition.
+    Large ChromeOS ROOT partitions are mostly free ext blocks, so the partition's
+    declared end remained several GiB away from the actual filesystem data.
+
+    This implementation:
+      1. extracts every GPT partition into the temporary workspace,
+      2. shrinks ext2/3/4 ROOT partitions with resize2fs -M,
+      3. packs partitions after the first ROOT partition together on 1 MiB boundaries,
+      4. rewrites both GPT headers/tables for the new LBAs, and
+      5. returns a new compact image path.
+
+    Partition GUIDs, attributes, names and partition order are preserved.
     """
-    import zlib
     sector = 512
     header, entries, entry_lba, entry_size = _read_gpt(path)
     if not entries:
         raise RuntimeError(f"[build:{board}] GPT contains no partitions")
 
-    root_entries = [e for e in entries if e["name"].upper() in {"ROOT-A", "ROOT-B"}]
+    root_entries = [e for e in entries if e["name"].upper() == "ROOT-A" or e["name"].upper() == "ROOT-B"]
     if not root_entries:
         raise RuntimeError(f"[build:{board}] no ROOT-A/ROOT-B partitions found")
-
-    print(f"[build:{board}] GPT partitions:")
-    for e in entries:
-        size_mib = (e["end"] - e["start"] + 1) * sector / 1024 / 1024
-        print(f"[build:{board}]   {e['name'] or '(unnamed)'}: {size_mib:.1f} MiB")
 
     first_root_index = min(e["index"] for e in root_entries)
     work_dir = tempfile.mkdtemp(prefix=f"kraft-compact-{board}-")
     compact_path = path + f".compact.{os.getpid()}.bin"
 
     try:
+        # Only ROOT partitions need temporary copies. Other partitions are read directly
+        # from the original image while the new image is written, which avoids needing
+        # another full copy of a multi-GiB shim on the GitHub runner.
+        root_indices = {x["index"] for x in root_entries}
         for e in entries:
+            if e["index"] not in root_indices:
+                continue
             part_path = os.path.join(work_dir, f"part-{e['index']:03d}.img")
-            with open(path, "rb") as src:
+            e["src_path"] = part_path
+            with open(path, "rb") as src, open(part_path, "wb") as dst:
                 src.seek(e["start"] * sector)
-                with open(part_path, "wb") as dst:
-                    remaining = (e["end"] - e["start"] + 1) * sector
-                    while remaining:
-                        chunk = src.read(min(16 * 1024 * 1024, remaining))
-                        if not chunk:
-                            raise RuntimeError(f"[build:{board}] truncated partition {e['index']}")
-                        dst.write(chunk)
-                        remaining -= len(chunk)
+                remaining = (e["end"] - e["start"] + 1) * sector
+                while remaining:
+                    chunk = src.read(min(16 * 1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError(f"[build:{board}] truncated partition {e['index']}")
+                    dst.write(chunk)
+                    remaining -= len(chunk)
 
-            old_sectors = e["end"] - e["start"] + 1
-            with open(part_path, "rb") as part:
-                part.seek(1024 + 0x38)
-                magic = part.read(2)
+            try:
+                new_sectors = _filesystem_min_size(part_path, board)
+                old_sectors = e["end"] - e["start"] + 1
+                if new_sectors >= old_sectors:
+                    print(f"[build:{board}] {e['name']}: filesystem did not shrink ({old_sectors} sectors)")
+                else:
+                    with open(part_path, "rb+") as f:
+                        f.truncate(new_sectors * sector)
+                    e["filesystem_shrunk"] = True
+                    e["new_size_sectors"] = new_sectors
+                    print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
+            except RuntimeError as exc:
+                    # Do not silently produce a bad image. A ROOT partition must be ext2/3/4
+                    # for the current KRAFT patcher, so a resize failure is fatal.
+                    raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
 
-            if magic == b"\x53\xef":
-                e["src_path"] = part_path
-                try:
-                    new_sectors = _filesystem_min_size(part_path, board)
-                    if new_sectors < old_sectors:
-                        with open(part_path, "rb+") as f:
-                            f.truncate(new_sectors * sector)
-                        e["new_size_sectors"] = new_sectors
-                        print(f"[build:{board}] {e['name']}: {old_sectors * sector / 1024 / 1024:.1f} MiB -> {new_sectors * sector / 1024 / 1024:.1f} MiB")
-                    else:
-                        print(f"[build:{board}] {e['name']}: ext filesystem did not shrink ({old_sectors * sector / 1024 / 1024:.1f} MiB)")
-                except RuntimeError as exc:
-                    if e["name"].upper() in {"ROOT-A", "ROOT-B"}:
-                        raise RuntimeError(f"[build:{board}] could not compact {e['name']}: {exc}") from exc
-                    print(f"[build:{board}] {e['name']}: could not shrink; preserving original size: {exc}")
-            else:
-                print(f"[build:{board}] {e['name']}: not an ext filesystem; preserving partition unchanged")
-                os.remove(part_path)
-
+        # Keep everything before the first ROOT partition exactly where it was.
+        # From the first ROOT onward, pack partitions with 1 MiB alignment.
         first_root = min(e["start"] for e in entries if e["index"] == first_root_index)
         cursor = first_root
         for e in entries:
@@ -481,7 +536,6 @@ def compact_gpt_image(path: str, board: str) -> str:
             if e["start"] < first_root:
                 e["new_start"] = original_start
                 e["new_size"] = original_size
-                e["new_end"] = original_start + original_size - 1
             else:
                 cursor = _align_lba(cursor)
                 new_size = e.get("new_size_sectors", original_size)
@@ -490,88 +544,65 @@ def compact_gpt_image(path: str, board: str) -> str:
                 e["new_end"] = cursor + new_size - 1
                 cursor = e["new_end"] + 1
 
+        # Ensure a little room for the backup GPT and its partition-entry array.
+        entry_sectors = (len(header) * 0 + struct.unpack_from("<I", header, 80)[0] * entry_size + sector - 1) // sector
+        last_data_lba = max(e.get("new_end", e["new_start"] + e["new_size"] - 1) for e in entries)
+        backup_header_lba = last_data_lba + 1
+        backup_table_lba = backup_header_lba - entry_sectors
+        final_last_lba = backup_header_lba
+
+        # Build a new primary table while preserving unused entries.
         count = struct.unpack_from("<I", header, 80)[0]
-        entry_sectors = (count * entry_size + sector - 1) // sector
-
-        last_data_lba = max(e["new_end"] for e in entries)
-
-        # backup GPT table goes right after the last data partition,
-        # backup GPT header goes after that — this is the correct GPT layout.
-        backup_table_lba = last_data_lba + 1
-        backup_header_lba = backup_table_lba + entry_sectors
-        final_disk_lba = backup_header_lba  # last LBA of the disk
-
-        # Build updated partition table with new LBAs
         table = bytearray(count * entry_size)
         for e in entries:
             raw = bytearray(e["raw"])
             struct.pack_into("<Q", raw, 32, e["new_start"])
-            struct.pack_into("<Q", raw, 40, e["new_end"])
+            struct.pack_into("<Q", raw, 40, e["new_end"] if "new_end" in e else e["new_start"] + e["new_size"] - 1)
             off = e["index"] * entry_size
             table[off:off + entry_size] = raw
 
-        table_crc = zlib.crc32(table) & 0xFFFFFFFF
-
-        # --- Primary GPT header ---
-        primary = bytearray(92)
-        primary[:len(header)] = header
-        # my_lba = 1
-        struct.pack_into("<Q", primary, 24, 1)
-        # alternate_lba = backup header LBA  (THE key fix)
-        struct.pack_into("<Q", primary, 32, backup_header_lba)
-        # first_usable_lba = 34 (right after primary table)
+        import zlib
+        # Update primary header's usable range and table CRC.
+        primary = bytearray(header)
         struct.pack_into("<Q", primary, 40, 34)
-        # last_usable_lba = backup_table_lba - 1
         struct.pack_into("<Q", primary, 48, backup_table_lba - 1)
-        # partition_entry_lba = 2 (unchanged)
         struct.pack_into("<Q", primary, 72, entry_lba)
-        # num_partition_entries + size_of_partition_entry unchanged
-        # partition_entry_array_crc32
-        struct.pack_into("<I", primary, 88, table_crc)
-        # header_crc32 — zero it first, then compute
+        struct.pack_into("<I", primary, 88, 0)
         struct.pack_into("<I", primary, 16, 0)
-        struct.pack_into("<I", primary, 16, zlib.crc32(primary[:92]) & 0xFFFFFFFF)
+        struct.pack_into("<I", primary, 88, zlib.crc32(table) & 0xffffffff)
+        struct.pack_into("<I", primary, 16, zlib.crc32(primary[:92]) & 0xffffffff)
 
-        # --- Backup GPT header ---
-        backup = bytearray(92)
-        backup[:len(header)] = header
-        # my_lba = backup_header_lba
-        struct.pack_into("<Q", backup, 24, backup_header_lba)
-        # alternate_lba = 1 (points to primary)
+        # The above primary header still has the original backup LBA. Set it now and
+        # recalculate the header CRC one final time.
+        struct.pack_into("<Q", primary, 32, final_last_lba)
+        struct.pack_into("<I", primary, 16, 0)
+        struct.pack_into("<I", primary, 16, zlib.crc32(primary[:92]) & 0xffffffff)
+
+        backup = bytearray(primary)
+        struct.pack_into("<Q", backup, 24, final_last_lba)
         struct.pack_into("<Q", backup, 32, 1)
-        # first_usable_lba same as primary
-        struct.pack_into("<Q", backup, 40, 34)
-        # last_usable_lba same as primary
-        struct.pack_into("<Q", backup, 48, backup_table_lba - 1)
-        # partition_entry_lba = backup_table_lba
         struct.pack_into("<Q", backup, 72, backup_table_lba)
-        # partition_entry_array_crc32
-        struct.pack_into("<I", backup, 88, table_crc)
-        # header_crc32
         struct.pack_into("<I", backup, 16, 0)
-        struct.pack_into("<I", backup, 16, zlib.crc32(backup[:92]) & 0xFFFFFFFF)
+        struct.pack_into("<I", backup, 16, zlib.crc32(backup[:92]) & 0xffffffff)
 
-        # Write the compact image
+        # Create the compact image. Keep the protective MBR and primary GPT area,
+        # then copy partition payloads to their new positions.
         with open(compact_path, "wb") as out:
-            # Copy protective MBR (LBA 0) + primary GPT header (LBA 1) area
             with open(path, "rb") as src:
-                prefix_len = entry_lba * sector  # up to start of partition table
+                prefix_len = entry_lba * sector
                 out.write(src.read(prefix_len))
-
-            # Write primary GPT header at LBA 1
             out.seek(sector)
             out.write(primary)
-
-            # Write primary partition table at entry_lba (usually LBA 2)
             out.seek(entry_lba * sector)
             out.write(table)
 
-            # Write partition payloads
+            root_indices = {x["index"] for x in root_entries}
             for e in entries:
                 dst_off = e["new_start"] * sector
                 out.seek(dst_off)
-                if "src_path" in e:
-                    with open(e["src_path"], "rb") as part:
+                if e["index"] in root_indices:
+                    src_path = e["src_path"]
+                    with open(src_path, "rb") as part:
                         shutil.copyfileobj(part, out, length=16 * 1024 * 1024)
                 else:
                     with open(path, "rb") as src:
@@ -584,16 +615,11 @@ def compact_gpt_image(path: str, board: str) -> str:
                             out.write(chunk)
                             remaining -= len(chunk)
 
-            # Write backup partition table
             out.seek(backup_table_lba * sector)
             out.write(table)
-
-            # Write backup GPT header
-            out.seek(backup_header_lba * sector)
+            out.seek(final_last_lba * sector)
             out.write(backup)
-
-            # Truncate to exact disk size
-            out.truncate((final_disk_lba + 1) * sector)
+            out.truncate((final_last_lba + 1) * sector)
 
         old_size = os.path.getsize(path)
         new_size = os.path.getsize(compact_path)
@@ -608,21 +634,27 @@ def compact_gpt_image(path: str, board: str) -> str:
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-
 def find_root_lba(path: str) -> Tuple[int, int]:
+    """
+    Safely parse GPT and find ROOT-A partition (preferred) or largest 'ROOT' partition by name.
+    Validate signature and partition table bounds.
+    """
     fsize = os.path.getsize(path)
     if fsize < 2048:
         raise RuntimeError("Image too small to contain GPT")
     with open(path, "rb") as f:
         header = f.read(34 * 512)
+    # GPT header signature at LBA1 (offset 512) should start with 'EFI PART'
     if header[512:520] != b"EFI PART":
         raise RuntimeError("No valid GPT signature ('EFI PART') found at LBA1")
     gpt = header[512:512+92]
     part_lba = read_uint64_le(gpt, 72)
     num = struct.unpack_from("<I", gpt, 80)[0]
     esz = struct.unpack_from("<I", gpt, 84)[0]
+    # Sanity checks
     if num == 0 or esz == 0:
         raise RuntimeError("Invalid GPT partition header values (num/esz)")
+    # ensure table read fits file
     table_bytes = num * esz
     with open(path, "rb") as f:
         f.seek(part_lba * 512)
@@ -640,12 +672,19 @@ def find_root_lba(path: str) -> Tuple[int, int]:
             roots.append((end - start, start, end, name))
     if not roots:
         raise RuntimeError("No valid ROOT partition found in GPT")
+    # prefer ROOT-A specifically; fall back to largest if not found
     root_a = [r for r in roots if r[3].upper() == "ROOT-A"]
     _, start, end, name = root_a[0] if root_a else sorted(roots, key=lambda x: x[0], reverse=True)[0]
     return int(start), int(end)
 
 
 class Ext2FS:
+    """
+    Small ext2 helper with defensive checks (NO full rewrite).
+    - Uses superblock-derived block size.
+    - Supports direct + single indirect pointers.
+    - Checks bounds before reads/writes.
+    """
     def __init__(self, img: bytearray):
         self.img = img
         if len(img) < 2048:
@@ -656,6 +695,7 @@ class Ext2FS:
         self.ipg = struct.unpack_from("<I", sb, 40)[0]
         self.isz = struct.unpack_from("<H", sb, 88)[0]
         self.gdt = struct.unpack_from("<I", sb, 20)[0] + 1
+        # bounds check
         if self.BS <= 0 or self.isz <= 0:
             raise RuntimeError("Invalid ext2 block or inode size from superblock")
 
@@ -693,6 +733,7 @@ class Ext2FS:
                 blocks.append(b)
         single = struct.unpack_from("<I", inode, 40 + 12*4)[0]
         if single:
+            # read block with pointers
             data = self._rb(single)
             count = self.BS // 4
             for i in range(count):
@@ -841,44 +882,8 @@ def verify_zip_contains_expected(out_zip: str, inner_name: str, board: str):
             raise RuntimeError(f"[build:{board}] unexpected inner bin name: {entries[0]} (expected {inner_name})")
 
 
-def _compress_with_xz(src_path: str, board: str) -> Optional[str]:
-    """
-    Compress src_path with xz (multi-threaded if available) and return the .xz path.
-    Falls back gracefully if xz is unavailable.
-    xz typically achieves 8-12x compression on ChromeOS shims (6 GiB -> ~500 MB).
-    """
-    xz_bin = shutil.which("xz")
-    if not xz_bin:
-        print(f"[build:{board}] xz not found; falling back to DEFLATE")
-        return None
-
-    out_path = src_path + ".xz"
-    # -T0 = use all CPU cores, -6 = good compression without extreme RAM use
-    cmd = [xz_bin, "-T0", "-6", "--keep", "-c", src_path]
-    print(f"[build:{board}] compressing with xz (this takes a few minutes)...")
-    try:
-        with open(out_path, "wb") as f:
-            proc = subprocess.run(cmd, stdout=f, check=False)
-        if proc.returncode != 0:
-            print(f"[build:{board}] xz failed with code {proc.returncode}; falling back to DEFLATE")
-            try:
-                os.remove(out_path)
-            except FileNotFoundError:
-                pass
-            return None
-        size_mib = os.path.getsize(out_path) / 1024 / 1024
-        print(f"[build:{board}] xz compressed to {size_mib:.1f} MiB")
-        return out_path
-    except Exception as e:
-        print(f"[build:{board}] xz error: {e}; falling back to DEFLATE")
-        try:
-            os.remove(out_path)
-        except FileNotFoundError:
-            pass
-        return None
-
-
 def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool = False) -> str:
+    # Basic sanity checks
     boards_cfg = read_boards_file()
     display_board, board = resolve_board(board_in)
     if board not in boards_cfg:
@@ -887,6 +892,7 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
     if display_board != board:
         print(f"[build:{display_board}] resolved alias -> {board}")
 
+    # required files
     for p in [MENU_PATH, STARTUP_PATH, STUB_PATH, BANNER_PATH]:
         if not os.path.exists(p):
             raise FileNotFoundError(f"[build:{board}] Missing required file: {p}")
@@ -897,7 +903,9 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
     out_zip = os.path.join(DIST_DIR, f"kraft_{board}.zip")
     temp_dir = tempfile.mkdtemp(prefix=f"kraft-{board}-")
     try:
+        # fetch or extract shim
         if local_zip:
+            # ensure local file exists and is a .bin or zip
             if not os.path.exists(local_zip):
                 raise FileNotFoundError(f"[build:{board}] local shim {local_zip} not found")
             shim_bin = extract_bin(local_zip, temp_dir, board)
@@ -905,31 +913,37 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
             shim_zip = download_shim(board, temp_dir, allow_fallback=allow_fallback)
             shim_bin = extract_bin(shim_zip, temp_dir, board)
 
+        # verify shim_bin exists and is reasonable
         if not os.path.exists(shim_bin):
             raise RuntimeError(f"[build:{board}] extracted shim {shim_bin} missing")
         if os.path.getsize(shim_bin) < 1024:
             raise RuntimeError(f"[build:{board}] shim {shim_bin} too small")
 
+        # parse GPT & find ROOT
         root_start, root_end = find_root_lba(shim_bin)
         p3_start = int(root_start) * 512
         p3_size = int(root_end - root_start) * 512
         fsize = os.path.getsize(shim_bin)
         if p3_start < 0 or p3_start + p3_size > fsize:
-            raise RuntimeError(f"[build:{board}] ROOT partition bounds out of range")
+            raise RuntimeError(f"[build:{board}] ROOT partition bounds out of range: start={p3_start} size={p3_size} file={fsize}")
 
+        # read ROOT-A into memory
         with open(shim_bin, "rb") as f:
             f.seek(p3_start)
             img = bytearray(f.read(p3_size))
 
+        # patch rootfs
         with open(MENU_PATH, "rb") as f: menu = f.read()
         with open(STARTUP_PATH, "rb") as f: startup = f.read()
         with open(BANNER_PATH, "rb") as f: banner = f.read()
         img = patch_rootfs(img, menu, startup, banner, board)
 
+        # write patched ROOT-A directly back into the shim (no full-file copy needed)
         with open(shim_bin, "r+b") as f:
             f.seek(p3_start)
             f.write(img)
 
+        # quick ext2 magic check
         with open(shim_bin, "rb") as f:
             f.seek(p3_start + 0x438)
             magic_data = f.read(2)
@@ -941,59 +955,14 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
 
         compacted_shim = compact_gpt_image(shim_bin, board)
 
+        # create the zip atomically
         inner_name = f"chromeos_kraft_{board}.bin"
         tmp_out = out_zip + f".tmp{os.getpid()}"
-
-        # Try xz compression first — yields ~500 MB vs ~5 GB for ChromeOS shims.
-        # The .zip wraps the .bin.xz so CRU / flash tools receive a standard zip.
-        # Users extract the .bin.xz and decompress with: xz -d chromeos_kraft_<board>.bin.xz
-        xz_path = _compress_with_xz(compacted_shim, board)
-        if xz_path:
-            xz_inner_name = inner_name + ".xz"
-            with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-                zf.write(xz_path, xz_inner_name)
-                # include a small README so users know to decompress before flashing
-                readme = (
-                    f"KRAFT shim for {board}\n"
-                    "======================\n\n"
-                    "The .bin inside this zip is xz-compressed to keep the download small.\n"
-                    "Before flashing, decompress it:\n\n"
-                    f"  Linux/macOS:  xz -d {xz_inner_name}\n"
-                    f"  Windows:      Use 7-Zip to extract the inner .bin\n\n"
-                    f"Then flash the resulting {inner_name} with Chromebook Recovery Utility\n"
-                    "or dd/Rufus as normal.\n"
-                )
-                zf.writestr("README.txt", readme)
-            os.remove(xz_path)
-            # Verify the zip contains what we expect (xz variant)
-            if not zipfile.is_zipfile(tmp_out):
-                raise RuntimeError(f"[build:{board}] output zip is not a valid zip")
-        else:
-            # Fallback: sparse + DEFLATE level 6 (better than level 1, still fast enough)
-            sparse_shim = compacted_shim + ".sparse"
-            zero_block = b"\x00" * (4 * 1024 * 1024)
-            with open(compacted_shim, "rb") as srcf, open(sparse_shim, "wb") as dstf:
-                logical = 0
-                while True:
-                    chunk = srcf.read(len(zero_block))
-                    if not chunk:
-                        break
-                    if chunk == zero_block[:len(chunk)]:
-                        dstf.seek(len(chunk), os.SEEK_CUR)
-                    else:
-                        dstf.write(chunk)
-                    logical += len(chunk)
-                dstf.truncate(logical)
-            physical_mib = os.stat(sparse_shim).st_blocks * 512 / 1024 / 1024
-            logical_mib = os.path.getsize(sparse_shim) / 1024 / 1024
-            print(f"[build:{board}] sparse image: logical {logical_mib:.1f} MiB, physical {physical_mib:.1f} MiB")
-            os.remove(compacted_shim)
-            compacted_shim = sparse_shim
-
-            with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
-                zf.write(compacted_shim, inner_name)
-            verify_zip_contains_expected(tmp_out, inner_name, board)
-
+        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+            zf.write(compacted_shim, inner_name)
+        # verify zipped content
+        verify_zip_contains_expected(tmp_out, inner_name, board)
+        # atomic rename
         os.replace(tmp_out, out_zip)
         try:
             os.remove(compacted_shim)
@@ -1003,6 +972,7 @@ def build(board_in: str, local_zip: Optional[str] = None, allow_fallback: bool =
         print(f"[build:{board}] done: {out_zip} ({os.path.getsize(out_zip)//1024//1024} MB)")
         return out_zip
     finally:
+        # cleanup
         try:
             shutil.rmtree(temp_dir)
         except Exception:
@@ -1030,3 +1000,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[build:{args.board}] ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+## I LOVE PYTHon? do I?
