@@ -1,5 +1,8 @@
 {
-  "_comment": "Supported boards for TPMstateDEM",
+  "_comment": "Supported boards for KRAFT",
+  "_shim_mirror": "https://dl.cros.download/{board}.zip",
+  "_releases_db_primary": "https://cdn.jsdelivr.net/gh/crosbreaker/chromeos-releases-data/data.json",
+  "_releases_db_fallback": "https://cdn.jsdelivr.net/gh/MercuryWorkshop/chromeos-releases-data/data.json",
   "nissa":    { "name": "Nissa",    "family": "nissa",   "arch": "x86_64" },
   "brya":     { "name": "Brya",     "family": "brya",    "arch": "x86_64" },
   "corsola":  { "name": "Corsola",  "family": "corsola", "arch": "arm64" },
