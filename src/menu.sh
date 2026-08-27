@@ -61,27 +61,65 @@ reset_tpm() {
     echo "  TPM Reset"
     echo "  =========="
     echo ""
-    
-    mosys nvram clear 2>/dev/null && echo "  [+] NVData cleared" \
-        || echo "  [-] NVData clear failed (non-fatal)"
-    
-    crossystem clear_tpm_owner_request=1 2>/dev/null && echo "  [+] TPM owner clear requested" || true
-    
-    if crossystem "mainfw_type?recovery" 2>/dev/null; then
-        chromeos-tpm-recovery 2>/dev/null && echo "  [+] TPM recovery OK" \
-            || echo "  [-] TPM recovery failed"
-    else
-        echo "  [*] Not in recovery mode — TPM recovery skipped"
+
+    ## must be in recovery mode for tpm write access — shim boots as recovery so this should be set
+    if ! crossystem "mainfw_type?recovery" 2>/dev/null; then
+        echo "  [!] Not in recovery mode. Boot from the KRAFT USB in recovery mode"
+        echo "      (hold Esc+Refresh then plug in) and try again."
+        return
     fi
-    ## report new kernel version
+
+    mosys nvram clear 2>/dev/null && echo "  [+] NVData cleared successfully!" \
+        || echo "  [-] NVData clear failed (non-fatal)"
+
+    crossystem clear_tpm_owner_request=1 2>/dev/null && echo "  [+] TPM owner clear requested" || true
+
+    ## nissa and other post-2019 Cr50 boards use tpm_manager instead of chromeos-tpm-recovery
+    ## try tpm_manager first, fall back to the older chromeos-tpm-recovery for pre-2019 boards
+    local tpm_ok=0
+    if command -v tpm_manager_client >/dev/null 2>&1; then
+        tpm_manager_client take_ownership 2>/dev/null \
+            && echo "  [+] TPM ownership taken via tpm_manager" \
+            && tpm_ok=1 \
+            || echo "  [-] tpm_manager_client failed"
+    fi
+
+    if [ "$tpm_ok" -eq 0 ] && command -v chromeos-tpm-recovery >/dev/null 2>&1; then
+        chromeos-tpm-recovery 2>/dev/null \
+            && echo "  [+] TPM recovery OK (chromeos-tpm-recovery)" \
+            && tpm_ok=1 \
+            || echo "  [-] chromeos-tpm-recovery failed"
+    fi
+
+    ## last resort: trunks_send for Cr50/Ti50 (nissa uses Ti50 and I happen to be testing on nissa)
+    if [ "$tpm_ok" -eq 0 ] && command -v trunks_send >/dev/null 2>&1; then
+        ## send TPM2_CC_Clear command directly
+        trunks_send --raw 80020000000c0000014100000107 2>/dev/null \
+            && echo "  [+] TPM cleared via trunks_send" \
+            && tpm_ok=1 \
+            || echo "  [-] trunks_send failed"
+    fi
+
+    if [ "$tpm_ok" -eq 0 ]; then
+        echo "  [-] All TPM reset methods failed. Try option 3 (Cr50 Reset) first,"
+        echo "      then reboot and run TPM Reset again."
+    fi
+
+    ## report new kernel version — if reset worked this should now read 1
     echo ""
     local kernver
     kernver="$(get_kernver)"
     echo "  Reported TPM Kernel Rollback Version: $kernver"
+    if [ "$kernver" = "1" ] || [ "$kernver" = "0" ]; then
+        echo "  [+] Looks good — kernver is at minimum, downgrade should work."
+    else
+        echo "  [!] kernver is still $kernver — reboot and run TPM Reset again."
+        echo "      If it stays high after two tries, do Cr50 Reset first."
+    fi
     echo ""
     echo "  Done."
 }
-## google binary block flags editor, just a bonus to edit stuff. you probably only need to disable fwmp.
+## google binary block flags editor, just a bonus to edit stuff. you probably only need to disable fwmp. honestly, this should better work in a shell and just use a ccd operation.
 edit_gbb() {
     echo ""
     echo "  GBB Flags Editor"
@@ -93,7 +131,7 @@ edit_gbb() {
     echo "  3) Dev + short delay       (0x9)"
     echo "  4) Disable FWMP            (0x40)"
     echo "  5) Dev + disable FWMP      (0x48)"
-    echo "  6) All useful flags        (0x49)"
+    echo "  6) All useful flags        (0x49)" ## check out binbashbanana's GBB-FLAGINATOR for more!
     echo "  7) Reset to factory        (0x0)"
     echo "  8) Custom hex"
     echo "  9) Back"
@@ -113,15 +151,21 @@ edit_gbb() {
         && echo "  [+] GBB flags set to $flags" \
         || echo "  [-] Failed - HW write protect may be on" ## you can bypass this by disconnected the battery. on most devices, it's the connector in the battery that says "batt" but if there's one that says "MB" pull that out instead since the battery cable is usually obstructed. MB cable connects the battery to the motherboard, as long as you wiggle it out carefully and a little firmly, you'll be able to safely put it back in.
 }
-## reset cr50, this is the least likely to work out of every script.
+## reset cr50, this is the least likely to work out of every script. (YES I KNOW THIS IS AUTOMATIC IN TPM RESET, I JUST ADDED IT AND I'M TOO LAZY TO DELETE TS)
 reset_cr50() {
     echo ""
     echo "  Cr50 Reset"
     echo "  ==========="
     echo ""
-    /usr/share/cros/cr50-reset.sh 2>/dev/null \
-        && echo "  [+] Cr50 reset complete" \
-        || echo "  [-] cr50-reset.sh not found or failed"
+    ## try cr50-reset.sh first, then fall back to gsctool for Ti50
+    if /usr/share/cros/cr50-reset.sh 2>/dev/null; then
+        echo "  [+] Cr50 reset complete"
+    elif gsctool -a --ccd_open 2>/dev/null; then
+        echo "  [+] CCD opened via gsctool (Ti50)"
+    else
+        echo "  [-] cr50/Ti50 reset failed — try running from crosh shell:"
+        echo "      gsctool -a --ccd_open"
+    fi
 }
 ## device stats, doesn't write anything.
 view_device_info() {

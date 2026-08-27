@@ -1,50 +1,181 @@
-name: Build TPMstateDEM
+name: Build KRAFT
 
 on:
   workflow_dispatch:
     inputs:
       board:
-        description: 'Board name'
+        description: "Board name (must match an entry in boards/boards.json)"
         required: true
-        default: 'nissa'
-  push:
-    branches:
-      - main
+        default: "nissa"
 
-permissions:
-  contents: write
+concurrency:
+  group: kraft-build-${{ github.event.inputs.board || 'manual' }}
+  cancel-in-progress: true
 
 jobs:
-  build-matrix:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        board: [nissa, brya, corsola, grunt, octopus, dedede, volteer, hatch, zork, puff, trogdor, strongbad, jacuzzi, kukui, coral, eve, rammus, reef, elm, hana, samus]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate board exists
+        env:
+          BOARD: ${{ github.event.inputs.board }}
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          board = os.environ["BOARD"]
+
+          # aliases defined in build.py — keep in sync if build.py changes
+          BOARD_ALIASES = {
+              "craasneto": "nissa",
+              "craask":    "nissa",
+          }
+
+          resolved = BOARD_ALIASES.get(board.strip().lower(), board.strip().lower())
+
+          with open("boards/boards.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          boards = [k for k in data.keys() if not k.startswith("_")]
+
+          if resolved not in boards:
+              print(
+                  f"Board '{board}' (resolved: '{resolved}') not found in boards/boards.json",
+                  file=sys.stderr
+              )
+              sys.exit(2)
+
+          if resolved != board:
+              print(f"Board alias '{board}' resolved to '{resolved}'")
+          print("Board validated:", resolved)
+          PY
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 unzip curl wget
+          sudo apt-get install -y python3 unzip curl e2fsprogs
+
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-      - name: Download and build
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/share/dotnet \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: Cache shim
+        id: cache-shim
+        uses: actions/cache@v4
+        with:
+          path: shim_cache
+          key: shim-${{ github.event.inputs.board }}-v1
+
+      - name: Restore cached shim
+        if: steps.cache-shim.outputs.cache-hit == 'true'
         run: |
-          python3 build.py ${{ matrix.board }}
+          BOARD="${{ github.event.inputs.board }}"
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          mkdir -p /tmp/kraft-shim
+          cp shim_cache/${RESOLVED}.bin /tmp/kraft-shim/${RESOLVED}.bin
+          echo "KRAFT_LOCAL_SHIM=/tmp/kraft-shim/${RESOLVED}.bin" >> $GITHUB_ENV
+
+      - name: Run build
+        env:
+          GITHUB_ACTIONS: "true"
+        run: |
+          BOARD="${{ github.event.inputs.board }}"
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          if [ -n "$KRAFT_LOCAL_SHIM" ] && [ -f "$KRAFT_LOCAL_SHIM" ]; then
+            echo "Using cached shim: $KRAFT_LOCAL_SHIM"
+            python3 build.py "$BOARD" "$KRAFT_LOCAL_SHIM"
+          else
+            python3 build.py "$BOARD"
+            # save shim to cache for next run
+            mkdir -p shim_cache
+            SHIM=$(find /tmp -name "${RESOLVED}.bin" -size +100M 2>/dev/null | head -1)
+            if [ -n "$SHIM" ]; then
+              cp "$SHIM" shim_cache/${RESOLVED}.bin
+            fi
+          fi
+
       - name: Validate output
+        env:
+          BOARD: ${{ github.event.inputs.board }}
         run: |
-          BOARD=${{ matrix.board }}
-          ZIP="dist/tpmstatedem_${BOARD}.zip"
-          [ -s "$ZIP" ] || exit 1
+          set -e
+
+          # resolve alias so we look for the right zip name (e.g. craasneto -> nissa)
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+
+          ZIP="dist/kraft_${RESOLVED}.zip"
+
+          if [ ! -s "$ZIP" ]; then
+            echo "Build output not found: $ZIP" >&2
+            exit 1
+          fi
+
+          echo "Archive contents:"
           unzip -l "$ZIP"
+
           COUNT=$(unzip -Z1 "$ZIP" | grep -c '\.bin$' || true)
-          [ "$COUNT" -eq 1 ] || exit 1
+
+          if [ "$COUNT" -ne 1 ]; then
+            echo "Expected exactly one .bin file, found $COUNT" >&2
+            exit 1
+          fi
+
+          INNER=$(unzip -Z1 "$ZIP" | grep '\.bin$' | head -n1)
+          EXPECTED="chromeos_kraft_${RESOLVED}.bin"
+
+          if [ "$INNER" != "$EXPECTED" ]; then
+            echo "Unexpected inner bin name: $INNER" >&2
+            echo "Expected: $EXPECTED" >&2
+            exit 2
+          fi
+
+          echo "Output validated successfully."
+          echo "ZIP size: $(du -h "$ZIP" | cut -f1)"
           sha256sum "$ZIP"
+
       - name: Upload artifact
+        env:
+          BOARD: ${{ github.event.inputs.board }}
+        run: |
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          echo "RESOLVED_BOARD=$RESOLVED" >> $GITHUB_ENV
+
+      - name: Upload artifact (upload)
         uses: actions/upload-artifact@v4
         with:
-          name: tpmstatedem-${{ matrix.board }}
-          path: dist/tpmstatedem_${{ matrix.board }}.zip
+          name: kraft-${{ github.event.inputs.board }}
+          path: dist/kraft_${{ env.RESOLVED_BOARD }}.zip
           retention-days: 14

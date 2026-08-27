@@ -10,8 +10,8 @@
 ____________________________________________
 |resets KV to 0x00010001 for cool stuff!   |
 |==========================================|
-|found and created by bashberryy! NOT for  |
-|to bypass restrictions! liability of using| 
+|found and created by bashberryy! NOT to   |
+|bypass restrictions! liability of using   | 
 |this program is on YOU.                   |
 |__________________________________________|
 
@@ -132,3 +132,4 @@ There are main and nightly branches because although we can test in the nightly 
 >       Main features may work, but are still being tested on full functionality.
 >
 >
+Please note that the use of this free software is subject to the laws and regulations applicable in your jurisdiction. Laws concerning computer modification and unauthorized access may apply depending on how and where the software is used. In the United States and United Kingdom, relevant legislation may include the [CFAA](https://www.justice.gov/jm/jm-9-48000-computer-fraud) and the [CMA](https://www.legislation.gov.uk/ukpga/1990/18/contents).
