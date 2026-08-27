@@ -3,11 +3,17 @@
 <pre>
 ██╗  ██╗ ██████╗   █████╗  ███████╗ ████████╗
 ██║ ██╔╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ╚══██╔══╝
-█████╔╝  ██████╔╝ ███████║ █████╗      ██║
-██╔═██╗  ██╔══██╗ ██╔══██║ ██╔══╝      ██║
-██║  ██╗ ██║  ██║ ██║  ██║ ██║         ██║
-╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝         ╚═╝
-__________________________________________
+█████╔╝  ██████╔╝ ███████║ █████╗      ██║   
+██╔═██╗  ██╔══██╗ ██╔══██║ ██╔══╝      ██║   
+██║  ██╗ ██║  ██║ ██║  ██║ ██║         ██║   
+╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝         ╚═╝ 
+____________________________________________
+|resets KV to 0x00010001 for cool stuff!   |
+|==========================================|
+|found and created by bashberryy! NOT to   |
+|bypass restrictions! liability of using   | 
+|this program is on YOU.                   |
+|__________________________________________|
 
   board: <board>   cros: M<version>   kernver: <version>
 
@@ -113,3 +119,17 @@ Depending on the device and environment, KRAFT provides functionality for:
 * **Rebooting** - restart the device after completing an operation.
 
 > **Availability and behavior may vary by board, ChromeOS version, firmware, and device state.**
+
+## BRANCHES
+
+As of now, there are **3** branches in this project, main, nightly, and LEGACY. The main branch is safe to assume that it is stable most of the time, although it is the development branch so it may not be sometimes. The nightly branch is and will always be the unstable beta for the next version. In the case that the main branch is unstable like the nightly branch, please focus onto the LEGACY branch, which is always table. Please report bugs in issues and feel free to create PR's for them!
+
+Why is there a main and nightly branch?
+There are main and nightly branches because although we can test in the nightly branch, humans are not perfect and a bug might slip through, so LEGACY is a layer of protection. 
+
+>
+> Note: We're adding the 2.0 branch which will be the varying stability branch like main. It is the beta with minimal issues or a version not ready to produce yet.
+>       Main features may work, but are still being tested on full functionality.
+>
+>
+Please note that the use of this free software is subject to the laws and regulations applicable in your jurisdiction. Laws concerning computer modification and unauthorized access may apply depending on how and where the software is used. In the United States and United Kingdom, relevant legislation may include the [CFAA](https://www.justice.gov/jm/jm-9-48000-computer-fraud) and the [CMA](https://www.legislation.gov.uk/ukpga/1990/18/contents).

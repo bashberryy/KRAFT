@@ -4,10 +4,10 @@
 ██╔═██╗  ██╔══██╗ ██╔══██║ ██╔══╝      ██║   
 ██║  ██╗ ██║  ██║ ██║  ██║ ██║         ██║   
 ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝         ╚═╝ 
-__________________________________________
-resets KV to 0x00010001 for cool stuff!
-===========================================
-found and created by bashberryy! do not use
-to bypass restrictions! liability of using 
-this program is on YOU.
-__________________________________________
+____________________________________________
+|resets KV to 0x00010001 for cool stuff!   |
+|==========================================|
+|found and created by bashberryy! NOT to   |
+|bypass restrictions! liability of using   | 
+|this program is on YOU.                   |
+|__________________________________________|
